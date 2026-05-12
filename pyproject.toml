@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ttt-kernel"
+version = "0.1.0"
+description = "Test-time training (online RL with LoRA) on KernelBench problems"
+requires-python = "==3.10.*"
+dependencies = [
+    "torch>=2.9.0",
+    "transformers>=4.45.0",
+    "peft>=0.13.0",
+    "accelerate>=0.34.0",
+    "datasets>=2.19.0",
+    "numpy",
+    "tqdm",
+    "pydantic>=2.0",
+    "pyyaml",
+    "requests",
+    "httpx",
+    "openai",
+    # KernelBench is installed as a path dependency (see README).
+]
+
+[project.optional-dependencies]
+gpu = [
+    "triton",
+    "nvidia-cutlass-dsl",
+]
+serve = [
+    # Install sglang separately per their instructions; pin here as a hint.
+    "sglang[all]>=0.4.0",
+]
+dev = ["pytest", "ruff"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["ttt_kernel*"]
