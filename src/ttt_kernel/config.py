@@ -86,11 +86,21 @@ class LoopCfg(BaseModel):
     seed: int = 0
 
 
+class WandbCfg(BaseModel):
+    enabled: bool = False
+    project: str = "ttt-kernel"
+    entity: Optional[str] = None
+    run_name: Optional[str] = None
+    mode: str = "online"  # online | offline | disabled
+    tags: List[str] = Field(default_factory=list)
+
+
 class LoggingCfg(BaseModel):
     out_dir: str = "./runs"
     run_name: Optional[str] = None
     log_every: int = 1
     save_adapter_every_turn: bool = True
+    wandb: WandbCfg = WandbCfg()
 
 
 class Config(BaseModel):

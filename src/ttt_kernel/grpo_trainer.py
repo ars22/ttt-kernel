@@ -82,8 +82,12 @@ class GRPOLoRATrainer:
 
     def save_adapter(self, out_dir: str) -> str:
         os.makedirs(out_dir, exist_ok=True)
+        # NOTE: we deliberately do NOT save the tokenizer here. SGLang's LoRA
+        # manager rejects adapters whose directory contains added_tokens.json
+        # ("LoRA serving currently doesn't support adapters that add tokens"),
+        # even when those tokens are part of the BASE tokenizer (e.g. Qwen3-
+        # Thinking's <think>/</think>). Tokenizer files live with the base model.
         self.model.save_pretrained(out_dir)
-        self.tokenizer.save_pretrained(out_dir)
         return out_dir
 
     def reset_adapter(self) -> None:

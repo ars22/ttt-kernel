@@ -20,6 +20,7 @@ dependencies = [
     "requests",
     "httpx",
     "openai",
+    "wandb",
     # KernelBench is installed as a path dependency (see README).
 ]
 

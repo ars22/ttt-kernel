@@ -78,3 +78,10 @@ logging:
   run_name: null               # auto: ttt_<timestamp>
   log_every: 1
   save_adapter_every_turn: true
+  wandb:
+    enabled: false             # set true (or override on CLI) to mirror metrics to wandb
+    project: ttt-kernel
+    entity: null               # null = wandb default for this user
+    run_name: null             # null = inherit logging.run_name
+    mode: online               # online | offline | disabled
+    tags: []

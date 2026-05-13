@@ -31,7 +31,12 @@ def run(cfg: Config) -> None:
     sglang = SGLangClient(cfg.sglang, model_name=cfg.model.name)
     trainer = GRPOLoRATrainer(cfg.model, cfg.lora, cfg.grpo)
 
-    logger = JsonlLogger(cfg.logging.out_dir, cfg.logging.run_name)
+    logger = JsonlLogger(
+        cfg.logging.out_dir,
+        cfg.logging.run_name,
+        wandb_cfg=cfg.logging.wandb,
+        full_config=cfg.model_dump(),
+    )
     logger.log("run_start", config=cfg.model_dump())
 
     sglang.wait_ready()
@@ -88,7 +93,7 @@ def run(cfg: Config) -> None:
                 n_compiled=n_compiled, n_correct=n_correct,
                 **_summarize("reward", rewards),
                 **_summarize("speedup", speedups),
-                **train_metrics,
+                **{f"train_{k}": v for k, v in train_metrics.items()},
             )
 
             # Push updated LoRA to the serving instance for the next turn.
