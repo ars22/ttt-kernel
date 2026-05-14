@@ -108,6 +108,8 @@ def _run_one_problem(
         speedups = [r.speedup for r in results if r.error_kind == "ok"]
         n_compiled = sum(1 for r in results if r.compiled)
         n_correct = sum(1 for r in results if r.correct)
+        comp_tokens = [int(g.completion_tokens) for g in gens if g.completion_tokens]
+        n_truncated = sum(1 for g in gens if g.finish_reason == "length")
 
         if rewards:
             mr = max(rewards)
@@ -129,11 +131,17 @@ def _run_one_problem(
             "n_rollouts": len(results),
             "n_compiled": n_compiled,
             "n_correct": n_correct,
+            "frac_compiled": n_compiled / max(len(results), 1),
+            "frac_correct": n_correct / max(len(results), 1),
             "reward_mean": sum(rewards) / max(len(rewards), 1),
             "reward_max": max(rewards) if rewards else 0.0,
             "reward_min": min(rewards) if rewards else 0.0,
             "speedup_mean": (sum(speedups) / len(speedups)) if speedups else 0.0,
             "speedup_max": max(speedups) if speedups else 0.0,
+            "completion_tokens_mean": (sum(comp_tokens) / len(comp_tokens)) if comp_tokens else 0.0,
+            "completion_tokens_max": max(comp_tokens) if comp_tokens else 0,
+            "completion_tokens_min": min(comp_tokens) if comp_tokens else 0,
+            "n_truncated": n_truncated,
             **{f"train_{k}": v for k, v in train_metrics.items()},
         })
 

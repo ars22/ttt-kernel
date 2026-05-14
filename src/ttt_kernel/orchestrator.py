@@ -284,6 +284,20 @@ async def run_pool(cfg: Config, config_path: str, overrides: List[str]) -> None:
         retries: dict[int, int] = {}
         MAX_RETRIES = 1
         dead_workers: set[int] = set()
+        # Progress counters — asyncio is single-threaded so plain ints are safe.
+        progress = {
+            "total": len(problem_ids),
+            "done": 0,
+            "correct": 0,
+            "failed": 0,
+        }
+        # Cumulative rollout-level counters across all problems × turns.
+        rollouts_total = {
+            "n": 0,
+            "truncated": 0,
+            "compiled": 0,
+            "correct": 0,
+        }
 
         # ---- per-worker dispatch loop -------------------------------------
         async def dispatch(w: WorkerHandle):
@@ -308,11 +322,41 @@ async def run_pool(cfg: Config, config_path: str, overrides: List[str]) -> None:
                             kind = ev.get("kind")
                             if kind == "turn":
                                 logger.log("turn", **ev)
+                                rollouts_total["n"] += int(ev.get("n_rollouts", 0))
+                                rollouts_total["truncated"] += int(ev.get("n_truncated", 0))
+                                rollouts_total["compiled"] += int(ev.get("n_compiled", 0))
+                                rollouts_total["correct"] += int(ev.get("n_correct", 0))
+                                n_tot = max(rollouts_total["n"], 1)
+                                logger.log(
+                                    "rollouts_cum",
+                                    rollouts_total=rollouts_total["n"],
+                                    rollouts_truncated=rollouts_total["truncated"],
+                                    rollouts_compiled=rollouts_total["compiled"],
+                                    rollouts_correct=rollouts_total["correct"],
+                                    frac_truncated=rollouts_total["truncated"] / n_tot,
+                                    frac_compiled=rollouts_total["compiled"] / n_tot,
+                                    frac_correct=rollouts_total["correct"] / n_tot,
+                                )
                             elif kind == "done":
                                 logger.log("problem_done", **ev)
                                 got_done = True
+                                # Worker-exit done events get the problem requeued
+                                # for another pair; don't count it as finished yet.
                                 if ev.get("worker_exiting"):
                                     worker_died = True
+                                    progress["failed"] += 1
+                                else:
+                                    progress["done"] += 1
+                                    if ev.get("any_correct"):
+                                        progress["correct"] += 1
+                                logger.log(
+                                    "progress",
+                                    problems_done=progress["done"],
+                                    problems_correct=progress["correct"],
+                                    problems_failed=progress["failed"],
+                                    problems_total=progress["total"],
+                                    frac_done=progress["done"] / max(progress["total"], 1),
+                                )
                                 break
                             elif kind == "error":
                                 logger.log("worker_error", pair=w.idx, problem_id=pid, **ev)

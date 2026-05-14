@@ -187,6 +187,8 @@ class GRPOLoRATrainer:
         total_loss = 0.0
         total_kl = 0.0
         total_pg = 0.0
+        total_gn = 0.0
+        n_updates = 0
         n = 0
 
         for epoch in range(self.grpo_cfg.update_epochs):
@@ -204,23 +206,29 @@ class GRPOLoRATrainer:
                 total_pg += metrics["pg"]
                 n += 1
 
-            torch.nn.utils.clip_grad_norm_(
+            grad_norm = torch.nn.utils.clip_grad_norm_(
                 (p for p in self.model.parameters() if p.requires_grad),
                 self.grpo_cfg.grad_clip,
             )
+            total_gn += float(grad_norm)
+            n_updates += 1
             self.optimizer.step()
             self.optimizer.zero_grad(set_to_none=True)
 
         # Reduce per-rank scalars to a global mean for logging.
         if self.world_size > 1:
-            t = torch.tensor([total_loss, total_kl, total_pg, float(n)], device=device)
+            t = torch.tensor(
+                [total_loss, total_kl, total_pg, total_gn, float(n), float(n_updates)],
+                device=device,
+            )
             dist.all_reduce(t, op=dist.ReduceOp.SUM)
-            total_loss, total_kl, total_pg, n = t.tolist()
+            total_loss, total_kl, total_pg, total_gn, n, n_updates = t.tolist()
 
         return {
             "loss": total_loss / max(n, 1),
             "kl": total_kl / max(n, 1),
             "pg": total_pg / max(n, 1),
+            "grad_norm": total_gn / max(n_updates, 1),
             "reward_mean": float(rewards.mean()),
             "reward_std": float(rewards.std(unbiased=False)) if rewards.numel() > 1 else 0.0,
             "advantage_mean": float(adv.mean()),
