@@ -59,6 +59,7 @@ async def _run_one_problem(
     sglang: SGLangClient,
     rollout_dir: Path,
     trainer_lock: asyncio.Lock,
+    sandbox_lock: asyncio.Lock,
 ) -> None:
     """Drive one problem through num_turns of online RL.
 
@@ -67,14 +68,21 @@ async def _run_one_problem(
     trainer model (serialized via `trainer_lock`) and the SGLang server.
     """
     adapter_name = f"ttt_pair{pair_idx}_pid{problem_id:03d}"
-    adapter_dir = os.path.abspath(f"{cfg.sglang.adapter_out_dir}_pair{pair_idx}_pid{problem_id:03d}")
+    # PEFT.save_pretrained(parent, selected_adapters=[name]) writes the
+    # adapter to `parent/<name>/` (a NESTED subdir, not the parent itself).
+    # SGLang's /load_lora_adapter wants the directory that contains
+    # adapter_config.json + adapter_model.safetensors directly — i.e. the
+    # nested path. So we pass `parent` to save_adapter and `parent/name` to
+    # SGLang for everything that follows.
+    adapter_parent = os.path.abspath(f"{cfg.sglang.adapter_out_dir}_pid{problem_id:03d}")
+    adapter_dir = os.path.join(adapter_parent, adapter_name)
 
     # --- per-problem setup ---------------------------------------------------
     # Trainer-side adapter creation must be serialized: PEFT mutates shared
     # model state when add_adapter is called (it walks every layer).
     async with trainer_lock:
         trainer.add_problem_adapter(adapter_name)
-        trainer.save_adapter(adapter_name, adapter_dir)
+        trainer.save_adapter(adapter_name, adapter_parent)
     # Register the adapter with SGLang so we can sample with it. Done outside
     # the trainer lock because it's a remote HTTP call, not local CUDA work.
     try:
@@ -87,11 +95,11 @@ async def _run_one_problem(
             trainer.delete_problem_adapter(adapter_name)
         return
 
-    # Spawn this problem's eval sandbox. Cheap (~1s) — a fresh CUDA context
-    # on the trainer GPU that isolates kernel-compile / kernel-launch failures
-    # from poisoning anything else.
+    # The eval sandbox is shared across all in-flight problems on this pair
+    # (one CUDA context for the lot, ~3 GB instead of P × 3 GB on the trainer
+    # GPU). open_sandbox is a no-op if it's already up.
     try:
-        env.open_sandbox(problem_id)
+        env.open_sandbox()
     except Exception as e:
         _emit({"kind": "done", "pair": pair_idx, "problem_id": problem_id,
                "error": f"open_sandbox failed: {e}",
@@ -121,13 +129,15 @@ async def _run_one_problem(
                 adapter_name=adapter_name,
             )
 
-            # --- evaluate (this problem's sandbox only; runs blocking calls
-            # in the default executor so we don't stall the event loop).
+            # --- evaluate (shared sandbox across in-flight problems on this
+            # pair; sandbox_lock serializes calls into env.evaluate so the
+            # single subprocess sees one request at a time).
             loop = asyncio.get_running_loop()
-            results = await loop.run_in_executor(
-                None,
-                lambda: [env.evaluate(problem, g.text) for g in gens],
-            )
+            async with sandbox_lock:
+                results = await loop.run_in_executor(
+                    None,
+                    lambda: [env.evaluate(problem, g.text) for g in gens],
+                )
 
             for k, r in enumerate(results):
                 rec = {
@@ -191,7 +201,7 @@ async def _run_one_problem(
             # Save weights + hot-swap into SGLang for the next turn's rollouts.
             if cfg.logging.save_adapter_every_turn or turn == cfg.loop.num_turns - 1:
                 async with trainer_lock:
-                    trainer.save_adapter(adapter_name, adapter_dir)
+                    trainer.save_adapter(adapter_name, adapter_parent)
                 await sglang.reload_adapter_async(adapter_name, adapter_dir)
 
         _emit({
@@ -209,11 +219,8 @@ async def _run_one_problem(
         _emit({"kind": "done", "pair": pair_idx, "problem_id": problem_id,
                "error": str(e), "traceback": traceback.format_exc()})
     finally:
-        # Always clean up the sandbox + SGLang slot + adapter, even on failure.
-        try:
-            env.close_sandbox(problem_id)
-        except Exception:
-            pass
+        # Sandbox is shared across all problems on this pair — do NOT close
+        # it here, only release this problem's SGLang slot + adapter.
         try:
             await sglang.unload_adapter_async(adapter_name)
         except Exception:
@@ -263,6 +270,9 @@ async def amain() -> None:
     await loop.connect_read_pipe(lambda: protocol, sys.stdin)
 
     trainer_lock = asyncio.Lock()
+    # All evaluate() calls go through the single shared eval sandbox; the lock
+    # serializes them so subprocess stdin/stdout traffic is one-at-a-time.
+    sandbox_lock = asyncio.Lock()
     inflight: dict[int, asyncio.Task] = {}
 
     def _on_done(pid: int):
@@ -301,7 +311,7 @@ async def amain() -> None:
             continue
         task = asyncio.create_task(
             _run_one_problem(pid, args.pair_idx, cfg, trainer, env, sglang,
-                             rollout_dir, trainer_lock),
+                             rollout_dir, trainer_lock, sandbox_lock),
             name=f"problem-{pid}",
         )
         task.add_done_callback(_on_done(pid))

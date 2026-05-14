@@ -40,6 +40,18 @@ class SGLangClient:
         # Big budget: with K=16 and max_tokens=64k on dp>=1, a single rollout
         # can take 30+ minutes when many requests are queued per replica.
         self._timeout = httpx.Timeout(3600.0)
+        # Adapter load/unload/reload on SGLang must be serialized: concurrent
+        # POSTs to /load_lora_adapter return 400 because the server only
+        # processes one adapter-mgmt request at a time. Sampling itself stays
+        # fully concurrent (handled by SGLang's continuous batching).
+        self._adapter_op_lock: Optional[asyncio.Lock] = None
+
+    def _lock(self) -> asyncio.Lock:
+        # Lock is lazy-initialized so it binds to whatever event loop is
+        # running when first used. Safe to call inside a coroutine.
+        if self._adapter_op_lock is None:
+            self._adapter_op_lock = asyncio.Lock()
+        return self._adapter_op_lock
 
     # ---- generation --------------------------------------------------------
 
@@ -120,38 +132,56 @@ class SGLangClient:
     # ---- dynamic adapter management (async) -------------------------------
 
     async def load_adapter_async(self, name: str, path: str) -> None:
-        """Register a LoRA adapter with the server (or refresh if already loaded).
+        """Register a LoRA adapter with the server.
 
-        On failure we still raise — the caller can decide whether to retry.
-        Use reload_adapter_async if you want unload-then-load semantics for
-        a hot-swap.
+        Serialized against other adapter-mgmt ops via _adapter_op_lock:
+        concurrent /load_lora_adapter calls would return 400 because SGLang's
+        adapter manager only handles one request at a time.
         """
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            r = await client.post(
-                f"{self.base_url}/load_lora_adapter",
-                json={"lora_name": name, "lora_path": os.path.abspath(path)},
-            )
-            r.raise_for_status()
+        async with self._lock():
+            async with httpx.AsyncClient(timeout=self._timeout) as client:
+                r = await client.post(
+                    f"{self.base_url}/load_lora_adapter",
+                    json={"lora_name": name, "lora_path": os.path.abspath(path)},
+                )
+                r.raise_for_status()
 
     async def unload_adapter_async(self, name: str) -> None:
         """Drop a LoRA adapter slot. Best-effort: 4xx is swallowed (not loaded)."""
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            try:
-                await client.post(
-                    f"{self.base_url}/unload_lora_adapter",
-                    json={"lora_name": name},
-                )
-            except httpx.HTTPError:
-                pass
+        async with self._lock():
+            async with httpx.AsyncClient(timeout=self._timeout) as client:
+                try:
+                    await client.post(
+                        f"{self.base_url}/unload_lora_adapter",
+                        json={"lora_name": name},
+                    )
+                except httpx.HTTPError:
+                    pass
 
     async def reload_adapter_async(self, name: str, path: str) -> None:
-        """Unload then re-load the adapter so SGLang re-reads weights from disk."""
-        await self.unload_adapter_async(name)
-        try:
-            await self.load_adapter_async(name, path)
-        except httpx.HTTPError as e:
-            # dp>1 servers reject dynamic LoRA — swallow so training continues.
-            print(f"[sglang] hot-swap of '{name}' failed ({e}); continuing")
+        """Unload then re-load the adapter so SGLang re-reads weights from disk.
+
+        The whole sequence is held under the lock so another problem can't
+        slip a load in between this problem's unload and re-load.
+        """
+        async with self._lock():
+            async with httpx.AsyncClient(timeout=self._timeout) as client:
+                try:
+                    await client.post(
+                        f"{self.base_url}/unload_lora_adapter",
+                        json={"lora_name": name},
+                    )
+                except httpx.HTTPError:
+                    pass
+                try:
+                    r = await client.post(
+                        f"{self.base_url}/load_lora_adapter",
+                        json={"lora_name": name, "lora_path": os.path.abspath(path)},
+                    )
+                    r.raise_for_status()
+                except httpx.HTTPError as e:
+                    # dp>1 servers reject dynamic LoRA — swallow so training continues.
+                    print(f"[sglang] hot-swap of '{name}' failed ({e}); continuing")
 
     # ---- LoRA hot-swap (legacy default-adapter shim) ----------------------
 

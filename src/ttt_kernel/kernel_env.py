@@ -101,11 +101,15 @@ class KernelEnv:
             dataset_name=cfg.dataset_name,
         )
 
-        # One sandbox subprocess per in-flight problem_id. Spawned via
-        # spawn_sandbox(pid) and torn down via close_sandbox(pid). nvcc compiles
-        # inside a sandbox are CPU-bound and can overlap; GPU work serializes
-        # naturally because all sandboxes share the trainer GPU.
-        self._sandboxes: dict[int, subprocess.Popen] = {}
+        # ONE sandbox subprocess per KernelEnv instance (per pair). All
+        # concurrent problems share it; the worker holds an asyncio.Lock
+        # around evaluate() so the dispatches are serialized. We had a
+        # per-problem sandbox design earlier, but each sandbox creates its
+        # own CUDA context (~3 GB) on the trainer GPU — with P=10 inflight
+        # that wiped out the entire trainer GPU. nvcc compile is CPU-bound
+        # but the GPU-side correctness/perf trials serialize anyway, so the
+        # per-problem variant gave very little throughput and a lot of risk.
+        self._eval_proc: Optional[subprocess.Popen] = None
         self._sandbox_log_path: Optional[str] = os.environ.get("TTT_SANDBOX_LOG")
 
     # ---- problem listing ----------------------------------------------------
@@ -175,57 +179,57 @@ class KernelEnv:
             raise RuntimeError(f"eval sandbox failed to init: {ready}")
         return proc
 
-    def open_sandbox(self, problem_id: int) -> None:
-        """Spawn (or respawn) the per-problem eval sandbox."""
-        existing = self._sandboxes.get(problem_id)
-        if existing is not None and existing.poll() is None:
+    def open_sandbox(self, problem_id: int = 0) -> None:
+        """Ensure the shared eval sandbox is alive. problem_id is ignored
+        (kept in the signature so callers can stay problem-aware)."""
+        if self._eval_proc is not None and self._eval_proc.poll() is None:
             return
-        self._sandboxes[problem_id] = self._spawn_one()
+        self._eval_proc = self._spawn_one()
 
-    def close_sandbox(self, problem_id: int) -> None:
-        proc = self._sandboxes.pop(problem_id, None)
-        if proc is None:
-            return
-        try:
-            proc.stdin.write(json.dumps({"cmd": "exit"}) + "\n")
-            proc.stdin.flush()
-            proc.wait(timeout=10)
-        except Exception:
-            proc.kill()
+    def close_sandbox(self, problem_id: int = 0) -> None:
+        """No-op if other problems are still running on the same pair.
+        Use close() to actually tear down the shared sandbox."""
+        return
 
     def _eval_via_sandbox(self, problem_id: int, ref_src: str, kernel_src: str) -> dict:
-        """Send one evaluate request, return parsed reply. Auto-respawns on death."""
+        """Send one evaluate request, return parsed reply. Auto-respawns on death.
+
+        Caller is responsible for serializing concurrent evaluate() calls
+        against this single shared sandbox via an asyncio.Lock.
+        """
         try:
-            proc = self._sandboxes.get(problem_id)
-            if proc is None or proc.poll() is not None:
-                # Sandbox died (e.g. CUDA context kill from a bad kernel) —
-                # respawn transparently for the next request.
-                self._sandboxes.pop(problem_id, None)
-                self.open_sandbox(problem_id)
-                proc = self._sandboxes[problem_id]
+            if self._eval_proc is None or self._eval_proc.poll() is not None:
+                self._eval_proc = self._spawn_one()
             req = json.dumps({"cmd": "evaluate", "ref_src": ref_src, "custom_src": kernel_src})
-            proc.stdin.write(req + "\n")
-            proc.stdin.flush()
-            line = proc.stdout.readline()
+            self._eval_proc.stdin.write(req + "\n")
+            self._eval_proc.stdin.flush()
+            line = self._eval_proc.stdout.readline()
             if not line:
-                rc = proc.poll()
-                self._sandboxes.pop(problem_id, None)
+                rc = self._eval_proc.poll()
+                self._eval_proc = None
                 return {
                     "status": "sandbox_died",
                     "error": f"sandbox stdout closed (returncode={rc})",
                 }
             return json.loads(line)
         except (BrokenPipeError, ConnectionResetError) as e:
-            self._sandboxes.pop(problem_id, None)
+            self._eval_proc = None
             return {"status": "sandbox_died", "error": str(e)}
         except Exception as e:  # noqa: BLE001
-            self._sandboxes.pop(problem_id, None)
+            self._eval_proc = None
             return {"status": "sandbox_died", "error": str(e),
                     "traceback": traceback.format_exc()}
 
     def close(self) -> None:
-        for pid in list(self._sandboxes.keys()):
-            self.close_sandbox(pid)
+        if self._eval_proc is None:
+            return
+        try:
+            self._eval_proc.stdin.write(json.dumps({"cmd": "exit"}) + "\n")
+            self._eval_proc.stdin.flush()
+            self._eval_proc.wait(timeout=10)
+        except Exception:
+            self._eval_proc.kill()
+        self._eval_proc = None
 
     # ---- the actual reward call --------------------------------------------
 
