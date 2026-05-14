@@ -101,10 +101,11 @@ class KernelEnv:
             dataset_name=cfg.dataset_name,
         )
 
-        # Sandbox subprocess handle; spawned lazily on first evaluate() call.
-        self._eval_proc: Optional[subprocess.Popen] = None
-        # Stash a pointer to our own stderr so we can dump the sandbox's
-        # stderr logs into a sibling stream if useful.
+        # One sandbox subprocess per in-flight problem_id. Spawned via
+        # spawn_sandbox(pid) and torn down via close_sandbox(pid). nvcc compiles
+        # inside a sandbox are CPU-bound and can overlap; GPU work serializes
+        # naturally because all sandboxes share the trainer GPU.
+        self._sandboxes: dict[int, subprocess.Popen] = {}
         self._sandbox_log_path: Optional[str] = os.environ.get("TTT_SANDBOX_LOG")
 
     # ---- problem listing ----------------------------------------------------
@@ -134,19 +135,15 @@ class KernelEnv:
 
     # ---- eval subprocess plumbing ------------------------------------------
 
-    def _spawn_sandbox(self) -> None:
-        """(Re)spawn the eval subprocess. Sends the init config and waits for ready."""
+    def _spawn_one(self) -> subprocess.Popen:
+        """Spawn a single eval subprocess, send init, wait for ready."""
         stderr_target: int | object
         if self._sandbox_log_path:
-            # Append-mode log; persists across respawns for forensic value.
             stderr_target = open(self._sandbox_log_path, "a", buffering=1)
         else:
             stderr_target = subprocess.DEVNULL
 
-        # Inherit env (esp. CUDA_VISIBLE_DEVICES + TORCH_EXTENSIONS_DIR which the
-        # orchestrator already set on the trainer-worker process).
         env = os.environ.copy()
-        # Make sure the package is importable.
         repo_src = os.path.join(os.path.dirname(os.path.dirname(__file__)))
         env["PYTHONPATH"] = repo_src + os.pathsep + env.get("PYTHONPATH", "")
 
@@ -176,52 +173,59 @@ class KernelEnv:
         ready = json.loads(ready_line)
         if ready.get("status") != "ready":
             raise RuntimeError(f"eval sandbox failed to init: {ready}")
-        self._eval_proc = proc
+        return proc
 
-    def _ensure_sandbox(self) -> None:
-        if self._eval_proc is not None and self._eval_proc.poll() is None:
+    def open_sandbox(self, problem_id: int) -> None:
+        """Spawn (or respawn) the per-problem eval sandbox."""
+        existing = self._sandboxes.get(problem_id)
+        if existing is not None and existing.poll() is None:
             return
-        self._eval_proc = None
-        self._spawn_sandbox()
+        self._sandboxes[problem_id] = self._spawn_one()
 
-    def _eval_via_sandbox(self, ref_src: str, kernel_src: str) -> dict:
-        """Send one evaluate request, return parsed reply.
-
-        On any pipe failure / dead sandbox, returns a synthetic exception reply
-        and lets the next call respawn.
-        """
+    def close_sandbox(self, problem_id: int) -> None:
+        proc = self._sandboxes.pop(problem_id, None)
+        if proc is None:
+            return
         try:
-            self._ensure_sandbox()
-            assert self._eval_proc is not None
+            proc.stdin.write(json.dumps({"cmd": "exit"}) + "\n")
+            proc.stdin.flush()
+            proc.wait(timeout=10)
+        except Exception:
+            proc.kill()
+
+    def _eval_via_sandbox(self, problem_id: int, ref_src: str, kernel_src: str) -> dict:
+        """Send one evaluate request, return parsed reply. Auto-respawns on death."""
+        try:
+            proc = self._sandboxes.get(problem_id)
+            if proc is None or proc.poll() is not None:
+                # Sandbox died (e.g. CUDA context kill from a bad kernel) —
+                # respawn transparently for the next request.
+                self._sandboxes.pop(problem_id, None)
+                self.open_sandbox(problem_id)
+                proc = self._sandboxes[problem_id]
             req = json.dumps({"cmd": "evaluate", "ref_src": ref_src, "custom_src": kernel_src})
-            self._eval_proc.stdin.write(req + "\n")
-            self._eval_proc.stdin.flush()
-            line = self._eval_proc.stdout.readline()
+            proc.stdin.write(req + "\n")
+            proc.stdin.flush()
+            line = proc.stdout.readline()
             if not line:
-                rc = self._eval_proc.poll()
-                self._eval_proc = None
+                rc = proc.poll()
+                self._sandboxes.pop(problem_id, None)
                 return {
                     "status": "sandbox_died",
                     "error": f"sandbox stdout closed (returncode={rc})",
                 }
             return json.loads(line)
         except (BrokenPipeError, ConnectionResetError) as e:
-            self._eval_proc = None
+            self._sandboxes.pop(problem_id, None)
             return {"status": "sandbox_died", "error": str(e)}
         except Exception as e:  # noqa: BLE001
-            self._eval_proc = None
+            self._sandboxes.pop(problem_id, None)
             return {"status": "sandbox_died", "error": str(e),
                     "traceback": traceback.format_exc()}
 
     def close(self) -> None:
-        if self._eval_proc is not None:
-            try:
-                self._eval_proc.stdin.write(json.dumps({"cmd": "exit"}) + "\n")
-                self._eval_proc.stdin.flush()
-                self._eval_proc.wait(timeout=10)
-            except Exception:
-                self._eval_proc.kill()
-            self._eval_proc = None
+        for pid in list(self._sandboxes.keys()):
+            self.close_sandbox(pid)
 
     # ---- the actual reward call --------------------------------------------
 
@@ -242,7 +246,7 @@ class KernelEnv:
                 error_kind="parse",
             )
 
-        reply = self._eval_via_sandbox(problem.ref_src, kernel_src)
+        reply = self._eval_via_sandbox(problem.problem_id, problem.ref_src, kernel_src)
         status = reply.get("status")
 
         if status == "ok":

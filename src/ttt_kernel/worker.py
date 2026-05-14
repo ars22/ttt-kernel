@@ -1,23 +1,32 @@
 """Trainer-worker subprocess for the pool architecture.
 
-One worker process == one (trainer, sampler) pair from the perspective of the
-trainer side. It owns:
+Runs as one process per (sampler, trainer) pair. Handles MULTIPLE in-flight
+problems concurrently via asyncio:
 
-  - a single PEFT model + optimizer (no DDP; one GPU per worker by default)
-  - a SGLangClient pointed at this worker's paired SGLang server URL
-  - its own LoRA adapter directory (so concurrent pairs don't overwrite each
-    other's adapters)
+  - One per-problem coroutine drives num_turns of (sample → eval → step → swap)
+    for one problem, with its own LoRA adapter on disk and on SGLang.
+  - The trainer GPU is shared; a single `trainer_lock` serializes the GRPO
+    step across problems (PEFT's active adapter is global state).
+  - Eval sandboxes are per-problem (kernel_env.open_sandbox(pid)); nvcc compiles
+    happen on CPU, so multiple sandboxes' compiles overlap.
+  - SGLang calls are unlocked: the same server handles K rollouts × P problems
+    in one continuous-batching scheduler.
 
-Protocol: the orchestrator writes one JSON line to our stdin per message; we
-write one JSON line per event over a *dedicated* JSON channel (the fd that was
-fd 1 when we started). At startup we redirect Python's sys.stdout to stderr
-so ad-hoc `print()` / progress bars / library logging never pollute the JSON
-stream. We emit `{"kind":"ready",...}` once, then for each problem assignment
-one `kind:"turn"` per turn and one `kind:"done"` at the end.
+Protocol (one JSON line per message in/out, over stdin/stdout):
+  in  : {"cmd": "process", "problem_id": int}
+        {"cmd": "exit"}
+  out : {"kind": "ready", "pair": int}
+        {"kind": "turn", "problem_id": int, "turn": int, ...metrics...}
+        {"kind": "done", "problem_id": int, ...summary...}
+        {"kind": "error" | "fatal", ...}
+
+fd 1 is reserved for JSON; sys.stdout + the underlying fd 1 are redirected to
+stderr at startup so library prints never corrupt the protocol channel.
 """
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 import sys
@@ -25,10 +34,6 @@ import traceback
 from pathlib import Path
 
 # --- Isolate the JSON channel ------------------------------------------------
-# Save fd 1 (real stdout, parent's pipe), then redirect Python's sys.stdout
-# and the underlying fd 1 to fd 2 (stderr → captured in worker_pair*.log). All
-# subsequent print() / tqdm / library output goes to stderr; only _emit() goes
-# back to the parent's JSON pipe via _JSON_OUT.
 _JSON_FD = os.dup(1)
 os.dup2(2, 1)
 _JSON_OUT = os.fdopen(_JSON_FD, "w", buffering=1)
@@ -45,118 +50,179 @@ def _emit(obj: dict) -> None:
     _JSON_OUT.flush()
 
 
-def _run_one_problem(
+async def _run_one_problem(
     problem_id: int,
+    pair_idx: int,
     cfg,
     trainer: GRPOLoRATrainer,
     env: KernelEnv,
     sglang: SGLangClient,
     rollout_dir: Path,
-    pair_idx: int,
-) -> dict:
-    if not cfg.loop.persist_adapter_across_problems:
-        trainer.reset_adapter()
-        trainer.save_adapter(cfg.sglang.adapter_out_dir)
-        sglang.reload_adapter()
+    trainer_lock: asyncio.Lock,
+) -> None:
+    """Drive one problem through num_turns of online RL.
+
+    Owns its own adapter (created here, deleted at the end) and its own eval
+    sandbox subprocess. Concurrent calls with other problem_ids share the
+    trainer model (serialized via `trainer_lock`) and the SGLang server.
+    """
+    adapter_name = f"ttt_pair{pair_idx}_pid{problem_id:03d}"
+    adapter_dir = os.path.abspath(f"{cfg.sglang.adapter_out_dir}_pair{pair_idx}_pid{problem_id:03d}")
+
+    # --- per-problem setup ---------------------------------------------------
+    # Trainer-side adapter creation must be serialized: PEFT mutates shared
+    # model state when add_adapter is called (it walks every layer).
+    async with trainer_lock:
+        trainer.add_problem_adapter(adapter_name)
+        trainer.save_adapter(adapter_name, adapter_dir)
+    # Register the adapter with SGLang so we can sample with it. Done outside
+    # the trainer lock because it's a remote HTTP call, not local CUDA work.
+    try:
+        await sglang.load_adapter_async(adapter_name, adapter_dir)
+    except Exception as e:
+        _emit({"kind": "done", "pair": pair_idx, "problem_id": problem_id,
+               "error": f"sglang load_adapter failed: {e}",
+               "traceback": traceback.format_exc()})
+        async with trainer_lock:
+            trainer.delete_problem_adapter(adapter_name)
+        return
+
+    # Spawn this problem's eval sandbox. Cheap (~1s) — a fresh CUDA context
+    # on the trainer GPU that isolates kernel-compile / kernel-launch failures
+    # from poisoning anything else.
+    try:
+        env.open_sandbox(problem_id)
+    except Exception as e:
+        _emit({"kind": "done", "pair": pair_idx, "problem_id": problem_id,
+               "error": f"open_sandbox failed: {e}",
+               "traceback": traceback.format_exc()})
+        try:
+            await sglang.unload_adapter_async(adapter_name)
+        finally:
+            async with trainer_lock:
+                trainer.delete_problem_adapter(adapter_name)
+        return
 
     problem = env.get_problem(problem_id)
     K = cfg.rollout.num_samples
-
     best_reward = float("-inf")
     best_speedup = 0.0
     any_correct = False
 
-    for turn in range(cfg.loop.num_turns):
-        gens = sglang.sample(
-            prompt=problem.prompt,
-            n=K,
-            temperature=cfg.rollout.temperature,
-            top_p=cfg.rollout.top_p,
-            max_tokens=cfg.rollout.max_tokens,
-            use_adapter=True,
-        )
-        results = [env.evaluate(problem, g.text) for g in gens]
+    try:
+        for turn in range(cfg.loop.num_turns):
+            # --- sample (async, unlocked: SGLang handles concurrent prompts)
+            gens = await sglang.sample_async(
+                prompt=problem.prompt,
+                n=K,
+                temperature=cfg.rollout.temperature,
+                top_p=cfg.rollout.top_p,
+                max_tokens=cfg.rollout.max_tokens,
+                adapter_name=adapter_name,
+            )
 
-        for k, r in enumerate(results):
-            rec = {
+            # --- evaluate (this problem's sandbox only; runs blocking calls
+            # in the default executor so we don't stall the event loop).
+            loop = asyncio.get_running_loop()
+            results = await loop.run_in_executor(
+                None,
+                lambda: [env.evaluate(problem, g.text) for g in gens],
+            )
+
+            for k, r in enumerate(results):
+                rec = {
+                    "problem_id": problem_id, "problem_name": problem.name,
+                    "turn": turn, "sample": k, "pair": pair_idx,
+                    "reward": r.reward, "compiled": r.compiled, "correct": r.correct,
+                    "speedup": r.speedup, "error_kind": r.error_kind,
+                    "runtime_ms": r.runtime_ms, "ref_runtime_ms": r.ref_runtime_ms,
+                    "feedback": r.feedback, "kernel_src": r.kernel_src,
+                    "completion": r.raw_completion, "prompt": problem.prompt,
+                }
+                fname = f"p{problem_id:03d}_t{turn}_s{k:02d}.json"
+                with open(rollout_dir / fname, "w") as f:
+                    json.dump(rec, f, ensure_ascii=False)
+
+            ros = [Rollout(prompt=problem.prompt, completion=r.raw_completion, reward=r.reward)
+                   for r in results]
+            # --- GRPO step (serialized across concurrent problems on this pair)
+            async with trainer_lock:
+                train_metrics = await loop.run_in_executor(
+                    None, lambda: trainer.step(ros, adapter_name=adapter_name),
+                )
+
+            rewards = [r.reward for r in results]
+            speedups = [r.speedup for r in results if r.error_kind == "ok"]
+            n_compiled = sum(1 for r in results if r.compiled)
+            n_correct = sum(1 for r in results if r.correct)
+            comp_tokens = [int(g.completion_tokens) for g in gens if g.completion_tokens]
+            n_truncated = sum(1 for g in gens if g.finish_reason == "length")
+
+            if rewards:
+                best_reward = max(best_reward, max(rewards))
+            if speedups:
+                best_speedup = max(best_speedup, max(speedups))
+            if n_correct > 0:
+                any_correct = True
+
+            _emit({
+                "kind": "turn",
+                "pair": pair_idx,
                 "problem_id": problem_id,
                 "problem_name": problem.name,
                 "turn": turn,
-                "sample": k,
-                "pair": pair_idx,
-                "reward": r.reward,
-                "compiled": r.compiled,
-                "correct": r.correct,
-                "speedup": r.speedup,
-                "error_kind": r.error_kind,
-                "runtime_ms": r.runtime_ms,
-                "ref_runtime_ms": r.ref_runtime_ms,
-                "feedback": r.feedback,
-                "kernel_src": r.kernel_src,
-                "completion": r.raw_completion,
-                "prompt": problem.prompt,
-            }
-            fname = f"p{problem_id:03d}_t{turn}_s{k:02d}.json"
-            with open(rollout_dir / fname, "w") as f:
-                json.dump(rec, f, ensure_ascii=False)
+                "n_rollouts": len(results),
+                "n_compiled": n_compiled,
+                "n_correct": n_correct,
+                "frac_compiled": n_compiled / max(len(results), 1),
+                "frac_correct": n_correct / max(len(results), 1),
+                "reward_mean": sum(rewards) / max(len(rewards), 1),
+                "reward_max": max(rewards) if rewards else 0.0,
+                "reward_min": min(rewards) if rewards else 0.0,
+                "speedup_mean": (sum(speedups) / len(speedups)) if speedups else 0.0,
+                "speedup_max": max(speedups) if speedups else 0.0,
+                "completion_tokens_mean": (sum(comp_tokens) / len(comp_tokens)) if comp_tokens else 0.0,
+                "completion_tokens_max": max(comp_tokens) if comp_tokens else 0,
+                "completion_tokens_min": min(comp_tokens) if comp_tokens else 0,
+                "n_truncated": n_truncated,
+                **{f"train_{k}": v for k, v in train_metrics.items()},
+            })
 
-        ros = [Rollout(prompt=problem.prompt, completion=r.raw_completion, reward=r.reward)
-               for r in results]
-        train_metrics = trainer.step(ros)
-
-        rewards = [r.reward for r in results]
-        speedups = [r.speedup for r in results if r.error_kind == "ok"]
-        n_compiled = sum(1 for r in results if r.compiled)
-        n_correct = sum(1 for r in results if r.correct)
-        comp_tokens = [int(g.completion_tokens) for g in gens if g.completion_tokens]
-        n_truncated = sum(1 for g in gens if g.finish_reason == "length")
-
-        if rewards:
-            mr = max(rewards)
-            if mr > best_reward:
-                best_reward = mr
-        if speedups:
-            ms = max(speedups)
-            if ms > best_speedup:
-                best_speedup = ms
-        if n_correct > 0:
-            any_correct = True
+            # Save weights + hot-swap into SGLang for the next turn's rollouts.
+            if cfg.logging.save_adapter_every_turn or turn == cfg.loop.num_turns - 1:
+                async with trainer_lock:
+                    trainer.save_adapter(adapter_name, adapter_dir)
+                await sglang.reload_adapter_async(adapter_name, adapter_dir)
 
         _emit({
-            "kind": "turn",
+            "kind": "done",
             "pair": pair_idx,
             "problem_id": problem_id,
-            "problem_name": problem.name,
-            "turn": turn,
-            "n_rollouts": len(results),
-            "n_compiled": n_compiled,
-            "n_correct": n_correct,
-            "frac_compiled": n_compiled / max(len(results), 1),
-            "frac_correct": n_correct / max(len(results), 1),
-            "reward_mean": sum(rewards) / max(len(rewards), 1),
-            "reward_max": max(rewards) if rewards else 0.0,
-            "reward_min": min(rewards) if rewards else 0.0,
-            "speedup_mean": (sum(speedups) / len(speedups)) if speedups else 0.0,
-            "speedup_max": max(speedups) if speedups else 0.0,
-            "completion_tokens_mean": (sum(comp_tokens) / len(comp_tokens)) if comp_tokens else 0.0,
-            "completion_tokens_max": max(comp_tokens) if comp_tokens else 0,
-            "completion_tokens_min": min(comp_tokens) if comp_tokens else 0,
-            "n_truncated": n_truncated,
-            **{f"train_{k}": v for k, v in train_metrics.items()},
+            "best_reward": best_reward if best_reward != float("-inf") else 0.0,
+            "best_speedup": best_speedup,
+            "any_correct": any_correct,
         })
+    except Exception as e:
+        # A per-problem failure shouldn't take down the whole worker — other
+        # problems may still be running on this pair. We only mark this one as
+        # failed and let the orchestrator decide whether to requeue.
+        _emit({"kind": "done", "pair": pair_idx, "problem_id": problem_id,
+               "error": str(e), "traceback": traceback.format_exc()})
+    finally:
+        # Always clean up the sandbox + SGLang slot + adapter, even on failure.
+        try:
+            env.close_sandbox(problem_id)
+        except Exception:
+            pass
+        try:
+            await sglang.unload_adapter_async(adapter_name)
+        except Exception:
+            pass
+        async with trainer_lock:
+            trainer.delete_problem_adapter(adapter_name)
 
-        if cfg.logging.save_adapter_every_turn or turn == cfg.loop.num_turns - 1:
-            trainer.save_adapter(cfg.sglang.adapter_out_dir)
-            sglang.reload_adapter()
 
-    return {
-        "best_reward": best_reward if best_reward != float("-inf") else 0.0,
-        "best_speedup": best_speedup,
-        "any_correct": any_correct,
-    }
-
-
-def main() -> None:
+async def amain() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
     ap.add_argument("--override", action="append", default=[])
@@ -166,8 +232,7 @@ def main() -> None:
     ap.add_argument("--run-dir", required=True)
     args = ap.parse_args()
 
-    # Single-process trainer; defensively clear distributed env so the
-    # GRPO trainer's _init_distributed returns (0, 1, 0).
+    # Single-process trainer; clear distributed env defensively.
     for k in ("RANK", "WORLD_SIZE", "LOCAL_RANK"):
         os.environ.pop(k, None)
 
@@ -179,7 +244,8 @@ def main() -> None:
         trainer = GRPOLoRATrainer(cfg.model, cfg.lora, cfg.grpo)
         env = KernelEnv(cfg.kernelbench, cfg.reward)
         sglang = SGLangClient(cfg.sglang, model_name=cfg.model.name)
-        sglang.wait_ready(timeout_s=1800.0)
+        # We're already inside an event loop — must use the async helper.
+        await sglang.wait_ready_async(timeout_s=1800.0)
     except Exception as e:
         _emit({"kind": "fatal", "pair": args.pair_idx, "error": str(e),
                "traceback": traceback.format_exc()})
@@ -190,8 +256,29 @@ def main() -> None:
 
     _emit({"kind": "ready", "pair": args.pair_idx})
 
-    for line in sys.stdin:
-        line = line.strip()
+    # Hook stdin into asyncio so we can `await` cmd lines without blocking.
+    loop = asyncio.get_running_loop()
+    reader = asyncio.StreamReader()
+    protocol = asyncio.StreamReaderProtocol(reader)
+    await loop.connect_read_pipe(lambda: protocol, sys.stdin)
+
+    trainer_lock = asyncio.Lock()
+    inflight: dict[int, asyncio.Task] = {}
+
+    def _on_done(pid: int):
+        def _cb(task: asyncio.Task) -> None:
+            inflight.pop(pid, None)
+            # Surface unhandled exceptions to stderr (the JSON channel already
+            # got the done/error event from _run_one_problem).
+            if task.exception() is not None:
+                sys.stderr.write(f"[worker] problem {pid} task error: {task.exception()}\n")
+        return _cb
+
+    while True:
+        raw = await reader.readline()
+        if not raw:
+            break  # parent closed our stdin
+        line = raw.decode().strip()
         if not line:
             continue
         try:
@@ -207,22 +294,26 @@ def main() -> None:
             _emit({"kind": "error", "pair": args.pair_idx, "error": f"unknown cmd: {cmd}"})
             continue
 
-        problem_id = msg["problem_id"]
-        try:
-            summary = _run_one_problem(
-                problem_id, cfg, trainer, env, sglang, rollout_dir, args.pair_idx,
-            )
-            _emit({"kind": "done", "pair": args.pair_idx, "problem_id": problem_id, **summary})
-        except Exception as e:
-            # Any exception that escapes _run_one_problem (CUDA illegal access,
-            # OOM, RuntimeError, etc.) tends to poison the CUDA context —
-            # subsequent problems would all fail in microseconds. Emit `done`
-            # with the error AND exit. The orchestrator detects EOF on stdout,
-            # requeues the problem, and stops dispatching to this worker.
-            _emit({"kind": "done", "pair": args.pair_idx, "problem_id": problem_id,
-                   "error": str(e), "traceback": traceback.format_exc(),
-                   "worker_exiting": True})
-            sys.exit(2)
+        pid = int(msg["problem_id"])
+        if pid in inflight:
+            _emit({"kind": "error", "pair": args.pair_idx, "problem_id": pid,
+                   "error": "already in flight"})
+            continue
+        task = asyncio.create_task(
+            _run_one_problem(pid, args.pair_idx, cfg, trainer, env, sglang,
+                             rollout_dir, trainer_lock),
+            name=f"problem-{pid}",
+        )
+        task.add_done_callback(_on_done(pid))
+        inflight[pid] = task
+
+    # Drain anything still running before exit.
+    if inflight:
+        await asyncio.gather(*inflight.values(), return_exceptions=True)
+
+
+def main() -> None:
+    asyncio.run(amain())
 
 
 if __name__ == "__main__":

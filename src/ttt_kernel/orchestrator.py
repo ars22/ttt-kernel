@@ -66,8 +66,13 @@ class WorkerHandle:
     def __init__(self, idx: int, proc: asyncio.subprocess.Process):
         self.idx = idx
         self.proc = proc
-        # Only one in-flight problem at a time per worker; lock guards the pipe.
-        self.lock = asyncio.Lock()
+        # A single concurrent writer is fine; this lock just keeps two
+        # write_cmd() callers from interleaving JSON lines onto the pipe.
+        self.write_lock = asyncio.Lock()
+        # Set of problem_ids currently in flight on this worker. The scheduler
+        # picks the worker with the smallest len(inflight).
+        self.inflight: set[int] = set()
+        self.dead = False
 
     async def read_event(self, timeout: float | None = None) -> dict:
         raw = await asyncio.wait_for(self.proc.stdout.readline(), timeout=timeout) \
@@ -77,9 +82,10 @@ class WorkerHandle:
         return json.loads(raw.decode())
 
     async def write_cmd(self, msg: dict) -> None:
-        line = json.dumps(msg) + "\n"
-        self.proc.stdin.write(line.encode())
-        await self.proc.stdin.drain()
+        async with self.write_lock:
+            line = json.dumps(msg) + "\n"
+            self.proc.stdin.write(line.encode())
+            await self.proc.stdin.drain()
 
 
 async def _launch_sglang(
@@ -279,110 +285,148 @@ async def run_pool(cfg: Config, config_path: str, overrides: List[str]) -> None:
         for pid in problem_ids:
             queue.put_nowait(pid)
 
-        # Track per-problem retry counts so a poisoned worker doesn't ping-pong
-        # the same bad kernel to every other pair until they all die too.
-        retries: dict[int, int] = {}
-        MAX_RETRIES = 1
-        dead_workers: set[int] = set()
-        # Progress counters — asyncio is single-threaded so plain ints are safe.
-        progress = {
-            "total": len(problem_ids),
-            "done": 0,
-            "correct": 0,
-            "failed": 0,
-        }
-        # Cumulative rollout-level counters across all problems × turns.
-        rollouts_total = {
-            "n": 0,
-            "truncated": 0,
-            "compiled": 0,
-            "correct": 0,
-        }
+        # Progress + cumulative-rollout counters (single-threaded asyncio: safe).
+        progress = {"total": len(problem_ids), "done": 0, "correct": 0, "failed": 0}
+        rollouts_total = {"n": 0, "truncated": 0, "compiled": 0, "correct": 0}
 
-        # ---- per-worker dispatch loop -------------------------------------
-        async def dispatch(w: WorkerHandle):
-            while True:
-                try:
-                    pid = queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    return
-                if w.idx in dead_workers:
-                    # Put it back for someone else and stop.
-                    queue.put_nowait(pid)
-                    return
-                worker_died = False
-                got_done = False
-                async with w.lock:
-                    try:
-                        logger.log("problem_dispatched", pair=w.idx, problem_id=pid)
-                        await w.write_cmd({"cmd": "process", "problem_id": pid})
-                        # Stream events until we see kind=done for this problem.
-                        while True:
-                            ev = await w.read_event()
-                            kind = ev.get("kind")
-                            if kind == "turn":
-                                logger.log("turn", **ev)
-                                rollouts_total["n"] += int(ev.get("n_rollouts", 0))
-                                rollouts_total["truncated"] += int(ev.get("n_truncated", 0))
-                                rollouts_total["compiled"] += int(ev.get("n_compiled", 0))
-                                rollouts_total["correct"] += int(ev.get("n_correct", 0))
-                                n_tot = max(rollouts_total["n"], 1)
-                                logger.log(
-                                    "rollouts_cum",
-                                    rollouts_total=rollouts_total["n"],
-                                    rollouts_truncated=rollouts_total["truncated"],
-                                    rollouts_compiled=rollouts_total["compiled"],
-                                    rollouts_correct=rollouts_total["correct"],
-                                    frac_truncated=rollouts_total["truncated"] / n_tot,
-                                    frac_compiled=rollouts_total["compiled"] / n_tot,
-                                    frac_correct=rollouts_total["correct"] / n_tot,
-                                )
-                            elif kind == "done":
-                                logger.log("problem_done", **ev)
-                                got_done = True
-                                # Worker-exit done events get the problem requeued
-                                # for another pair; don't count it as finished yet.
-                                if ev.get("worker_exiting"):
-                                    worker_died = True
-                                    progress["failed"] += 1
-                                else:
-                                    progress["done"] += 1
-                                    if ev.get("any_correct"):
-                                        progress["correct"] += 1
-                                logger.log(
-                                    "progress",
-                                    problems_done=progress["done"],
-                                    problems_correct=progress["correct"],
-                                    problems_failed=progress["failed"],
-                                    problems_total=progress["total"],
-                                    frac_done=progress["done"] / max(progress["total"], 1),
-                                )
-                                break
-                            elif kind == "error":
-                                logger.log("worker_error", pair=w.idx, problem_id=pid, **ev)
-                            else:
-                                logger.log("worker_event", **ev)
-                    except Exception as e:
-                        logger.log("dispatch_error", pair=w.idx, problem_id=pid, error=str(e))
-                        worker_died = True
-                    finally:
+        # Signaled whenever a problem completes so the scheduler can wake up
+        # and re-check capacity (avoids busy-wait sleep loops).
+        slot_event = asyncio.Event()
+        max_inflight = max(1, int(pool.max_inflight_per_pair))
+
+        def _alive() -> list[WorkerHandle]:
+            return [w for w in workers if not w.dead]
+
+        def _least_loaded() -> WorkerHandle | None:
+            alive = [w for w in _alive() if len(w.inflight) < max_inflight]
+            if not alive:
+                return None
+            return min(alive, key=lambda w: len(w.inflight))
+
+        # ---- per-worker event listener ------------------------------------
+        async def listen(w: WorkerHandle):
+            try:
+                while True:
+                    ev = await w.read_event()
+                    kind = ev.get("kind")
+                    if kind == "turn":
+                        logger.log("turn", **ev)
+                        rollouts_total["n"] += int(ev.get("n_rollouts", 0))
+                        rollouts_total["truncated"] += int(ev.get("n_truncated", 0))
+                        rollouts_total["compiled"] += int(ev.get("n_compiled", 0))
+                        rollouts_total["correct"] += int(ev.get("n_correct", 0))
+                        n_tot = max(rollouts_total["n"], 1)
+                        logger.log(
+                            "rollouts_cum",
+                            rollouts_total=rollouts_total["n"],
+                            rollouts_truncated=rollouts_total["truncated"],
+                            rollouts_compiled=rollouts_total["compiled"],
+                            rollouts_correct=rollouts_total["correct"],
+                            frac_truncated=rollouts_total["truncated"] / n_tot,
+                            frac_compiled=rollouts_total["compiled"] / n_tot,
+                            frac_correct=rollouts_total["correct"] / n_tot,
+                        )
+                    elif kind == "done":
+                        pid = int(ev.get("problem_id", -1))
+                        logger.log("problem_done", **ev)
+                        w.inflight.discard(pid)
+                        if ev.get("error"):
+                            progress["failed"] += 1
+                        else:
+                            progress["done"] += 1
+                            if ev.get("any_correct"):
+                                progress["correct"] += 1
+                        logger.log(
+                            "progress",
+                            problems_done=progress["done"],
+                            problems_correct=progress["correct"],
+                            problems_failed=progress["failed"],
+                            problems_total=progress["total"],
+                            frac_done=progress["done"] / max(progress["total"], 1),
+                        )
+                        slot_event.set()
+                    elif kind == "error":
+                        logger.log("worker_error", pair=w.idx, **ev)
+                    elif kind == "fatal":
+                        logger.log("worker_fatal", pair=w.idx, **ev)
+                        w.dead = True
+                        slot_event.set()
+                        break
+                    else:
+                        logger.log("worker_event", **ev)
+            except Exception as e:
+                # EOF on stdout => worker process is gone. Mark all of its
+                # in-flight problems as failed and let the scheduler reassign.
+                logger.log("listener_error", pair=w.idx, error=str(e))
+                w.dead = True
+                for pid in list(w.inflight):
+                    progress["failed"] += 1
+                    logger.log("problem_done", pair=w.idx, problem_id=pid,
+                               error="worker died", any_correct=False)
+                    logger.log("progress",
+                               problems_done=progress["done"],
+                               problems_correct=progress["correct"],
+                               problems_failed=progress["failed"],
+                               problems_total=progress["total"],
+                               frac_done=progress["done"] / max(progress["total"], 1))
+                w.inflight.clear()
+                slot_event.set()
+
+        listener_tasks = [asyncio.create_task(listen(w), name=f"listen-{w.idx}")
+                          for w in workers]
+
+        # ---- central scheduler --------------------------------------------
+        async def scheduler():
+            while not queue.empty():
+                pid = await queue.get()
+                # Wait for a pair with capacity. slot_event is set by `listen`
+                # on every `done` event, so this resolves the moment a slot
+                # frees up — no polling.
+                while True:
+                    w = _least_loaded()
+                    if w is not None:
+                        break
+                    if not _alive():
+                        # All workers dead → drain the queue as failed.
+                        progress["failed"] += 1
+                        logger.log("problem_done", problem_id=pid,
+                                   error="all workers dead", any_correct=False)
+                        logger.log("progress",
+                                   problems_done=progress["done"],
+                                   problems_correct=progress["correct"],
+                                   problems_failed=progress["failed"],
+                                   problems_total=progress["total"],
+                                   frac_done=progress["done"] / max(progress["total"], 1))
                         queue.task_done()
+                        return
+                    slot_event.clear()
+                    await slot_event.wait()
+                w.inflight.add(pid)
+                logger.log("problem_dispatched", pair=w.idx, problem_id=pid,
+                           pair_inflight=len(w.inflight))
+                try:
+                    await w.write_cmd({"cmd": "process", "problem_id": pid})
+                except Exception as e:
+                    logger.log("dispatch_error", pair=w.idx, problem_id=pid, error=str(e))
+                    w.inflight.discard(pid)
+                    w.dead = True
+                    slot_event.set()
+                    # Requeue this problem for someone else.
+                    queue.put_nowait(pid)
+                queue.task_done()
 
-                if worker_died:
-                    dead_workers.add(w.idx)
-                    logger.log("worker_dead", pair=w.idx)
-                    # Requeue the problem (cap retries to avoid infinite ping-pong).
-                    n = retries.get(pid, 0)
-                    if not got_done or n < MAX_RETRIES:
-                        retries[pid] = n + 1
-                        queue.put_nowait(pid)
-                        logger.log("problem_requeued", problem_id=pid, retries=retries[pid])
-                    return
+            # Drain phase: wait for every dispatched problem to finish.
+            while any(w.inflight for w in _alive()):
+                slot_event.clear()
+                await slot_event.wait()
 
-        await asyncio.gather(*[dispatch(w) for w in workers])
+        await scheduler()
         logger.log("queue_drained")
 
-        # ---- shutdown workers ---------------------------------------------
+        # ---- stop listeners + shut down workers ---------------------------
+        for t in listener_tasks:
+            t.cancel()
+        await asyncio.gather(*listener_tasks, return_exceptions=True)
         for w in workers:
             try:
                 await w.write_cmd({"cmd": "exit"})

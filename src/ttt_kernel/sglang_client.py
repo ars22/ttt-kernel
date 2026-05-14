@@ -18,7 +18,7 @@ from __future__ import annotations
 import asyncio
 import os
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional
 
 import httpx
 
@@ -51,15 +51,16 @@ class SGLangClient:
         temperature: float,
         top_p: float,
         max_tokens: int,
-        use_adapter: bool,
+        adapter_name: Optional[str] = None,
     ) -> GenerationResult:
         # /v1/chat/completions so SGLang applies the model's chat template
         # automatically. Instruct-style models degenerate badly on raw
         # /v1/completions because no special tokens (assistant marker etc.)
         # frame the response. KernelBench's prompt is a single self-contained
         # user turn, so wrapping it as one `user` message is faithful.
+        # adapter_name: which loaded LoRA to use; None = base model.
         payload = {
-            "model": self.adapter_name if use_adapter else self.model_name,
+            "model": adapter_name if adapter_name is not None else self.model_name,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": temperature,
             "top_p": top_p,
@@ -78,7 +79,7 @@ class SGLangClient:
             completion_tokens=int(usage.get("completion_tokens", 0)),
         )
 
-    async def _sample_async(
+    async def sample_async(
         self,
         prompt: str,
         *,
@@ -86,14 +87,15 @@ class SGLangClient:
         temperature: float,
         top_p: float,
         max_tokens: int,
-        use_adapter: bool,
+        adapter_name: Optional[str] = None,
     ) -> List[GenerationResult]:
+        """Async fan-out of n rollouts for one prompt against the given adapter."""
         async with httpx.AsyncClient(timeout=self._timeout) as client:
             tasks = [
                 self._one_completion(
                     client, prompt,
                     temperature=temperature, top_p=top_p,
-                    max_tokens=max_tokens, use_adapter=use_adapter,
+                    max_tokens=max_tokens, adapter_name=adapter_name,
                 )
                 for _ in range(n)
             ]
@@ -107,103 +109,60 @@ class SGLangClient:
         temperature: float,
         top_p: float,
         max_tokens: int,
-        use_adapter: bool = True,
+        adapter_name: Optional[str] = None,
     ) -> List[GenerationResult]:
-        """Fan out n parallel rollouts for the same prompt. Sync entry point."""
-        return asyncio.run(self._sample_async(
+        """Sync wrapper for sample_async (spins its own event loop)."""
+        return asyncio.run(self.sample_async(
             prompt, n=n, temperature=temperature, top_p=top_p,
-            max_tokens=max_tokens, use_adapter=use_adapter,
+            max_tokens=max_tokens, adapter_name=adapter_name,
         ))
 
-    async def _sample_many_async(
-        self,
-        prompts: List[str],
-        *,
-        n: int,
-        temperature: float,
-        top_p: float,
-        max_tokens: int,
-        use_adapter: bool,
-    ) -> List[List[GenerationResult]]:
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            tasks = []
-            for prompt in prompts:
-                for _ in range(n):
-                    tasks.append(self._one_completion(
-                        client, prompt,
-                        temperature=temperature, top_p=top_p,
-                        max_tokens=max_tokens, use_adapter=use_adapter,
-                    ))
-            flat = await asyncio.gather(*tasks)
-        out: List[List[GenerationResult]] = []
-        for b in range(len(prompts)):
-            out.append(flat[b * n : (b + 1) * n])
-        return out
+    # ---- dynamic adapter management (async) -------------------------------
 
-    def sample_many(
-        self,
-        prompts: List[str],
-        *,
-        n: int,
-        temperature: float,
-        top_p: float,
-        max_tokens: int,
-        use_adapter: bool = True,
-    ) -> List[List[GenerationResult]]:
-        """Fan out len(prompts)*n parallel rollouts (n per prompt) in one loop.
+    async def load_adapter_async(self, name: str, path: str) -> None:
+        """Register a LoRA adapter with the server (or refresh if already loaded).
 
-        Lets SGLang's scheduler interleave requests across multiple problems
-        instead of running them sequentially. Returns a list of length
-        len(prompts); element b is a list of n GenerationResults.
+        On failure we still raise — the caller can decide whether to retry.
+        Use reload_adapter_async if you want unload-then-load semantics for
+        a hot-swap.
         """
-        return asyncio.run(self._sample_many_async(
-            prompts, n=n, temperature=temperature, top_p=top_p,
-            max_tokens=max_tokens, use_adapter=use_adapter,
-        ))
+        async with httpx.AsyncClient(timeout=self._timeout) as client:
+            r = await client.post(
+                f"{self.base_url}/load_lora_adapter",
+                json={"lora_name": name, "lora_path": os.path.abspath(path)},
+            )
+            r.raise_for_status()
 
-    # ---- LoRA hot-swap -----------------------------------------------------
-
-    async def _reload_adapter_async(self) -> None:
-        # SGLang 0.5+ LoRA hot-swap = unload then re-load. There's no in-place
-        # update; we have to drop the slot and re-register the path. /unload
-        # may 4xx if the adapter isn't currently registered (e.g. very first
-        # turn after a server bounce) — that's fine, swallow it.
-        #
-        # When the server was launched with dp_size>1, SGLang rejects dynamic
-        # LoRA load/unload entirely. We swallow that too so the training loop
-        # can continue; the trade-off is the server keeps serving the initial
-        # adapter (rollouts won't reflect trainer updates).
+    async def unload_adapter_async(self, name: str) -> None:
+        """Drop a LoRA adapter slot. Best-effort: 4xx is swallowed (not loaded)."""
         async with httpx.AsyncClient(timeout=self._timeout) as client:
             try:
                 await client.post(
                     f"{self.base_url}/unload_lora_adapter",
-                    json={"lora_name": self.adapter_name},
+                    json={"lora_name": name},
                 )
             except httpx.HTTPError:
                 pass
-            try:
-                r = await client.post(
-                    f"{self.base_url}/load_lora_adapter",
-                    json={
-                        "lora_name": self.adapter_name,
-                        "lora_path": self.adapter_out_dir,
-                    },
-                )
-                r.raise_for_status()
-            except httpx.HTTPError as e:
-                print(f"[sglang] LoRA hot-swap failed ({e}); continuing with stale adapter")
+
+    async def reload_adapter_async(self, name: str, path: str) -> None:
+        """Unload then re-load the adapter so SGLang re-reads weights from disk."""
+        await self.unload_adapter_async(name)
+        try:
+            await self.load_adapter_async(name, path)
+        except httpx.HTTPError as e:
+            # dp>1 servers reject dynamic LoRA — swallow so training continues.
+            print(f"[sglang] hot-swap of '{name}' failed ({e}); continuing")
+
+    # ---- LoRA hot-swap (legacy default-adapter shim) ----------------------
 
     def reload_adapter(self) -> None:
-        """Tell SGLang to re-read the adapter from disk.
-
-        Requires SGLang to have been started with
-        `--lora-paths <adapter_name>=<adapter_out_dir> --enable-lora`.
-        """
-        asyncio.run(self._reload_adapter_async())
+        """Compatibility shim: refresh the default `adapter_name` from disk."""
+        asyncio.run(self.reload_adapter_async(self.adapter_name, self.adapter_out_dir))
 
     # ---- health check ------------------------------------------------------
 
-    async def _wait_ready_async(self, timeout_s: float) -> None:
+    async def wait_ready_async(self, timeout_s: float = 120.0) -> None:
+        """Poll /v1/models until the server responds 200 or timeout elapses."""
         import time
 
         deadline = time.time() + timeout_s
@@ -222,4 +181,5 @@ class SGLangClient:
         )
 
     def wait_ready(self, timeout_s: float = 120.0) -> None:
-        asyncio.run(self._wait_ready_async(timeout_s))
+        """Sync wrapper. Caller must NOT already be inside a running event loop."""
+        asyncio.run(self.wait_ready_async(timeout_s))

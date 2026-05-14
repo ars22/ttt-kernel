@@ -100,6 +100,12 @@ class PoolCfg(BaseModel):
     sampler: StageParallelCfg = StageParallelCfg()
     trainer: StageParallelCfg = StageParallelCfg()
     base_port: int = 30000
+    # Maximum number of in-flight problems per pair. The orchestrator dispatches
+    # new problems to the pair with the smallest current load, up to this cap.
+    max_inflight_per_pair: int = 10
+    # Hard cap on adapters SGLang can keep registered at once; should be at
+    # least max_inflight_per_pair. Drives --max-loaded-loras / --max-loras-per-batch.
+    sglang_max_loras: int = 16
 
 
 class LoopCfg(BaseModel):

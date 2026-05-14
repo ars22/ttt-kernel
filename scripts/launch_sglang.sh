@@ -53,6 +53,8 @@ PY
 fi
 
 ATTN_BACKEND="${ATTN_BACKEND:-triton}"  # avoid flashinfer JIT against system nvcc
+MAX_LORAS_PER_BATCH="${MAX_LORAS_PER_BATCH:-16}"   # distinct adapters in one batch
+MAX_LORA_RANK="${MAX_LORA_RANK:-32}"               # cap on r for any loaded adapter
 
 exec python -m sglang.launch_server \
   --model-path "$MODEL_NAME" \
@@ -64,4 +66,6 @@ exec python -m sglang.launch_server \
   --attention-backend "$ATTN_BACKEND" \
   --trust-remote-code \
   --lora-paths "${ADAPTER_NAME}=${ADAPTER_DIR}" \
-  --enable-lora
+  --enable-lora \
+  --max-loras-per-batch "$MAX_LORAS_PER_BATCH" \
+  --max-lora-rank "$MAX_LORA_RANK"

@@ -81,7 +81,7 @@ class GRPOLoRATrainer:
             torch_dtype=_dtype_from_str(model_cfg.dtype),
             trust_remote_code=model_cfg.trust_remote_code,
         )
-        peft_config = LoraConfig(
+        self._peft_config = LoraConfig(
             r=lora_cfg.r,
             lora_alpha=lora_cfg.alpha,
             lora_dropout=lora_cfg.dropout,
@@ -89,7 +89,7 @@ class GRPOLoRATrainer:
             bias=lora_cfg.bias,
             task_type="CAUSAL_LM",
         )
-        peft_model: PeftModel = get_peft_model(base, peft_config)
+        peft_model: PeftModel = get_peft_model(base, self._peft_config)
         peft_model.to(self.device)
         peft_model.train()
         self._peft_model = peft_model  # unwrapped; used for save/disable_adapter
@@ -107,60 +107,109 @@ class GRPOLoRATrainer:
         else:
             self.model = peft_model
 
-        # Optimizer over LoRA params only.
-        self.optimizer = torch.optim.AdamW(
-            (p for p in self.model.parameters() if p.requires_grad),
-            lr=grpo_cfg.learning_rate,
-            weight_decay=grpo_cfg.weight_decay,
+        # Per-adapter AdamW: keyed by adapter name. The "default" adapter exists
+        # immediately from get_peft_model and stays around as a placeholder
+        # (PEFT requires at least one adapter to be loaded at any time).
+        self.optimizers: dict[str, torch.optim.AdamW] = {}
+
+    # ---- multi-adapter API -------------------------------------------------
+
+    def _adapter_params(self, name: str) -> list[torch.nn.Parameter]:
+        """Trainable parameters belonging to the named adapter only."""
+        # PEFT names LoRA params like
+        #   base_model.model.model.layers.0.self_attn.q_proj.lora_A.<name>.weight
+        # So we filter by `.<name>.` to keep the active adapter's A/B matrices.
+        tag = f".{name}."
+        return [
+            p for n, p in self._peft_model.named_parameters()
+            if p.requires_grad and tag in n
+        ]
+
+    def add_problem_adapter(self, name: str) -> None:
+        """Create a fresh adapter for a problem and register an optimizer for it.
+
+        Kaiming-inits the lora_A matrices, zero-inits lora_B (zero-effect
+        starting point). Explicitly activates the new adapter and forces
+        requires_grad=True on its params — PEFT's add_adapter alone doesn't
+        reliably mark them trainable across versions.
+        """
+        if name in self.optimizers:
+            return
+        self._peft_model.add_adapter(name, self._peft_config)
+        # set_adapter() flips requires_grad: the named adapter's lora_A/B get
+        # True, every other adapter's get False. Required for the optimizer
+        # construction below to see any trainable params.
+        self._peft_model.set_adapter(name)
+        # Belt-and-suspenders: some PEFT versions don't toggle requires_grad
+        # on set_adapter for adapters loaded after the initial get_peft_model.
+        for n, p in self._peft_model.named_parameters():
+            if f".{name}." in n and ("lora_A" in n or "lora_B" in n):
+                p.requires_grad = True
+            if "lora_A" in n and f".{name}." in n:
+                torch.nn.init.kaiming_uniform_(p, a=5 ** 0.5)
+            elif "lora_B" in n and f".{name}." in n:
+                torch.nn.init.zeros_(p)
+        params = self._adapter_params(name)
+        if not params:
+            # Debug fallback: enumerate matching names so the error message is
+            # actually useful next time the naming convention shifts.
+            matches = [n for n, _ in self._peft_model.named_parameters() if f".{name}." in n]
+            raise RuntimeError(
+                f"no trainable params found for adapter '{name}'. "
+                f"matching names ({len(matches)}): {matches[:5]}"
+            )
+        self.optimizers[name] = torch.optim.AdamW(
+            params,
+            lr=self.grpo_cfg.learning_rate,
+            weight_decay=self.grpo_cfg.weight_decay,
         )
 
-    # ---- IO helpers --------------------------------------------------------
+    def delete_problem_adapter(self, name: str) -> None:
+        """Release the adapter's weights + optimizer state."""
+        # Drop optimizer first so its param refs don't keep weights alive.
+        self.optimizers.pop(name, None)
+        try:
+            self._peft_model.delete_adapter(name)
+        except Exception:
+            # delete_adapter raises if `name` isn't loaded — safe to ignore.
+            pass
 
-    def save_adapter(self, out_dir: str) -> str:
+    def save_adapter(self, name: str, out_dir: str) -> str:
+        """Save just the named adapter's weights to disk.
+
+        NOTE: we deliberately do NOT save the tokenizer here. SGLang's LoRA
+        manager rejects adapters whose directory contains added_tokens.json,
+        even when those tokens are part of the BASE tokenizer.
+        """
         os.makedirs(out_dir, exist_ok=True)
-        # NOTE: we deliberately do NOT save the tokenizer here. SGLang's LoRA
-        # manager rejects adapters whose directory contains added_tokens.json
-        # ("LoRA serving currently doesn't support adapters that add tokens"),
-        # even when those tokens are part of the BASE tokenizer (e.g. Qwen3-
-        # Thinking's <think>/</think>). Tokenizer files live with the base model.
-        # Only rank 0 writes; other ranks wait at a barrier so the next
-        # reload_adapter call sees a complete adapter on disk.
         if self.rank == 0:
-            self._peft_model.save_pretrained(out_dir)
+            # `selected_adapters` ensures only this one adapter's files land
+            # in `out_dir` — important because SGLang reads adapter_config.json
+            # from that directory and would be confused by a multi-adapter dump.
+            self._peft_model.save_pretrained(out_dir, selected_adapters=[name])
         if self.world_size > 1:
             dist.barrier()
         return out_dir
 
-    def reset_adapter(self) -> None:
-        """Re-init LoRA weights to zero-effect (for fresh-per-problem mode).
-
-        Under DDP we only init on rank 0 (kaiming_uniform_ draws from each
-        rank's RNG independently — they would diverge otherwise), then
-        broadcast the LoRA params to keep replicas bit-identical.
-        """
-        if self.rank == 0:
-            for name, p in self._peft_model.named_parameters():
-                if "lora_A" in name:
-                    torch.nn.init.kaiming_uniform_(p, a=5 ** 0.5)
-                elif "lora_B" in name:
-                    torch.nn.init.zeros_(p)
-        if self.world_size > 1:
-            for name, p in self._peft_model.named_parameters():
-                if "lora_A" in name or "lora_B" in name:
-                    dist.broadcast(p.data, src=0)
-            dist.barrier()
-
     # ---- one GRPO step over K rollouts -------------------------------------
 
-    def step(self, rollouts: List[Rollout], group_ids: Optional[List[int]] = None) -> dict:
-        """One GRPO update from a flat list of rollouts, optionally split into groups.
+    def step(
+        self,
+        rollouts: List[Rollout],
+        *,
+        adapter_name: str,
+        group_ids: Optional[List[int]] = None,
+    ) -> dict:
+        """One GRPO update on the named adapter.
 
-        When `group_ids` is provided, advantages are computed PER group (so the
-        baseline is per-problem). Under multi-problem batching this is essential
-        — a single global baseline across problems would couple their rewards.
-
-        Returns a dict of scalar metrics for logging.
+        Caller is responsible for serializing concurrent `step` calls against
+        the trainer GPU (they all share base-model state). The PPO-clipped
+        forward+backward only flows gradients into the named adapter's params.
         """
+        if adapter_name not in self.optimizers:
+            raise KeyError(f"adapter '{adapter_name}' not loaded; call add_problem_adapter first")
+        self._peft_model.set_adapter(adapter_name)
+        optimizer = self.optimizers[adapter_name]
         device = self.device
         rewards = torch.tensor([r.reward for r in rollouts], dtype=torch.float32, device=device)
 
@@ -207,13 +256,13 @@ class GRPOLoRATrainer:
                 n += 1
 
             grad_norm = torch.nn.utils.clip_grad_norm_(
-                (p for p in self.model.parameters() if p.requires_grad),
+                self._adapter_params(adapter_name),
                 self.grpo_cfg.grad_clip,
             )
             total_gn += float(grad_norm)
             n_updates += 1
-            self.optimizer.step()
-            self.optimizer.zero_grad(set_to_none=True)
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
 
         # Reduce per-rank scalars to a global mean for logging.
         if self.world_size > 1:
