@@ -63,8 +63,8 @@ grpo:
   learning_rate: 1.0e-5
   weight_decay: 0.0
   grad_clip: 1.0
-  micro_batch_size: 1          # per-device batch for the policy forward pass
-  max_seq_len: 8192            # truncate the (prompt + completion) for the loss pass
+  micro_batch_size: 1          # per-device batch; 1 is the safe choice at 16k seq × 150k vocab (Qwen3 vocab is huge → logits dominate memory)
+  max_seq_len: 16384           # truncate the (prompt + completion) for the loss pass; covers ~p95 of completions and keeps batched forward in memory
 
 loop:
   num_turns: 5                 # multi-turn online RL: turns per (batch of) problem(s)

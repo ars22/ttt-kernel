@@ -59,7 +59,6 @@ async def _run_one_problem(
     sglang: SGLangClient,
     rollout_dir: Path,
     trainer_lock: asyncio.Lock,
-    sandbox_lock: asyncio.Lock,
 ) -> None:
     """Drive one problem through num_turns of online RL.
 
@@ -95,11 +94,12 @@ async def _run_one_problem(
             trainer.delete_problem_adapter(adapter_name)
         return
 
-    # The eval sandbox is shared across all in-flight problems on this pair
-    # (one CUDA context for the lot, ~3 GB instead of P × 3 GB on the trainer
-    # GPU). open_sandbox is a no-op if it's already up.
+    # Per-rollout sandbox: K sandboxes per problem so all K kernels of a turn
+    # nvcc-compile in parallel. With max_inflight_per_pair=1, only one set of
+    # K sandboxes lives on a trainer GPU at a time → memory bounded.
+    K = cfg.rollout.num_samples
     try:
-        env.open_sandbox()
+        env.open_sandboxes(problem_id, n=K)
     except Exception as e:
         _emit({"kind": "done", "pair": pair_idx, "problem_id": problem_id,
                "error": f"open_sandbox failed: {e}",
@@ -112,7 +112,7 @@ async def _run_one_problem(
         return
 
     problem = env.get_problem(problem_id)
-    K = cfg.rollout.num_samples
+    # K already bound above for open_sandboxes.
     best_reward = float("-inf")
     best_speedup = 0.0
     any_correct = False
@@ -129,15 +129,17 @@ async def _run_one_problem(
                 adapter_name=adapter_name,
             )
 
-            # --- evaluate (shared sandbox across in-flight problems on this
-            # pair; sandbox_lock serializes calls into env.evaluate so the
-            # single subprocess sees one request at a time).
+            # --- evaluate: K parallel evaluate() calls, one per rollout slot.
+            # Each rollout has its own sandbox subprocess so nvcc compiles
+            # run in parallel across the K rollouts on CPU cores.
             loop = asyncio.get_running_loop()
-            async with sandbox_lock:
-                results = await loop.run_in_executor(
+            results = await asyncio.gather(*[
+                loop.run_in_executor(
                     None,
-                    lambda: [env.evaluate(problem, g.text) for g in gens],
+                    lambda g=g, s=k: env.evaluate(problem, g.text, slot=s),
                 )
+                for k, g in enumerate(gens)
+            ])
 
             for k, r in enumerate(results):
                 rec = {
@@ -219,8 +221,10 @@ async def _run_one_problem(
         _emit({"kind": "done", "pair": pair_idx, "problem_id": problem_id,
                "error": str(e), "traceback": traceback.format_exc()})
     finally:
-        # Sandbox is shared across all problems on this pair — do NOT close
-        # it here, only release this problem's SGLang slot + adapter.
+        try:
+            env.close_sandboxes(problem_id)
+        except Exception:
+            pass
         try:
             await sglang.unload_adapter_async(adapter_name)
         except Exception:
@@ -270,9 +274,6 @@ async def amain() -> None:
     await loop.connect_read_pipe(lambda: protocol, sys.stdin)
 
     trainer_lock = asyncio.Lock()
-    # All evaluate() calls go through the single shared eval sandbox; the lock
-    # serializes them so subprocess stdin/stdout traffic is one-at-a-time.
-    sandbox_lock = asyncio.Lock()
     inflight: dict[int, asyncio.Task] = {}
 
     def _on_done(pid: int):
@@ -311,7 +312,7 @@ async def amain() -> None:
             continue
         task = asyncio.create_task(
             _run_one_problem(pid, args.pair_idx, cfg, trainer, env, sglang,
-                             rollout_dir, trainer_lock, sandbox_lock),
+                             rollout_dir, trainer_lock),
             name=f"problem-{pid}",
         )
         task.add_done_callback(_on_done(pid))

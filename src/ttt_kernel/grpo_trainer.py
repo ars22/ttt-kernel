@@ -200,11 +200,17 @@ class GRPOLoRATrainer:
         adapter_name: str,
         group_ids: Optional[List[int]] = None,
     ) -> dict:
-        """One GRPO update on the named adapter.
+        """One GRPO update on the named adapter (batched over all rollouts).
+
+        All K rollouts are tokenized, right-padded into one [B, T] batch, and
+        run through the model in a SINGLE forward+backward. This replaces the
+        previous Python for-loop over rollouts, which serialized 8 small
+        forwards back-to-back and barely used the GPU. Batched pass is ~5–10×
+        faster on a B200 because cuBLAS / flash-attention can process all K
+        sequences in one go.
 
         Caller is responsible for serializing concurrent `step` calls against
-        the trainer GPU (they all share base-model state). The PPO-clipped
-        forward+backward only flows gradients into the named adapter's params.
+        the trainer GPU (they all share base-model state).
         """
         if adapter_name not in self.optimizers:
             raise KeyError(f"adapter '{adapter_name}' not loaded; call add_problem_adapter first")
@@ -219,8 +225,7 @@ class GRPOLoRATrainer:
 
         # Per-group advantage normalization (GRPO baseline is per-group).
         adv = torch.zeros_like(rewards)
-        unique_groups = sorted(set(group_ids))
-        for g in unique_groups:
+        for g in sorted(set(group_ids)):
             idx = [i for i, gi in enumerate(group_ids) if gi == g]
             idx_t = torch.tensor(idx, device=device, dtype=torch.long)
             r_g = rewards[idx_t]
@@ -230,130 +235,149 @@ class GRPOLoRATrainer:
                 a = r_g - r_g.mean()
             adv[idx_t] = a
 
-        # Slice rollouts across ranks for data-parallel training.
-        my_indices = list(range(self.rank, len(rollouts), self.world_size))
+        # ---- tokenize + pad ALL rollouts into one batched tensor ----------
+        max_seq = self.grpo_cfg.max_seq_len
+        pad_id = self.tokenizer.pad_token_id
+        ids_list: list[torch.Tensor] = []
+        comp_mask_list: list[torch.Tensor] = []
+        for ro in rollouts:
+            try:
+                prompt_ids = self.tokenizer.apply_chat_template(
+                    [{"role": "user", "content": ro.prompt}],
+                    add_generation_prompt=True,
+                    return_tensors="pt",
+                )[0]
+            except Exception:
+                prompt_ids = self.tokenizer(
+                    ro.prompt, return_tensors="pt", add_special_tokens=False,
+                ).input_ids[0]
+            comp_ids = self.tokenizer(
+                ro.completion, return_tensors="pt", add_special_tokens=False,
+            ).input_ids[0]
+            if prompt_ids.numel() + comp_ids.numel() > max_seq:
+                # Thinking-model completions are "[CoT] </think> [kernel]" so
+                # the IMPORTANT tokens are at the END. Keep the LAST chunk of
+                # the completion (including </think> + final kernel + EOS) and
+                # drop the head (mostly redundant reasoning). Previously we
+                # kept comp_ids[:keep_comp] which trained on raw thinking and
+                # missed the actual kernel — a real bug for RL-on-thinking.
+                keep_comp = min(comp_ids.numel(), max_seq - prompt_ids.numel())
+                # Cap prompt to at least 512 tokens of the FENCE around the
+                # user request so the model has the problem in context.
+                if keep_comp < 64:
+                    keep_comp = min(comp_ids.numel(), max_seq // 2)
+                keep_prompt = max_seq - keep_comp
+                prompt_ids = prompt_ids[-keep_prompt:]
+                comp_ids = comp_ids[-keep_comp:]  # keep LAST keep_comp tokens
+            ids = torch.cat([prompt_ids, comp_ids])
+            m = torch.zeros(ids.numel(), dtype=torch.float32)
+            m[prompt_ids.numel():] = 1.0  # completion positions only
+            ids_list.append(ids)
+            comp_mask_list.append(m)
 
-        total_loss = 0.0
-        total_kl = 0.0
-        total_pg = 0.0
-        total_gn = 0.0
-        n_updates = 0
-        n = 0
+        B = len(ids_list)
+        T = max(ids.numel() for ids in ids_list)
+        input_ids = torch.full((B, T), pad_id, dtype=torch.long, device=device)
+        attn_mask = torch.zeros((B, T), dtype=torch.long, device=device)
+        comp_mask = torch.zeros((B, T), dtype=torch.float32, device=device)
+        for i, (ids, m) in enumerate(zip(ids_list, comp_mask_list)):
+            L = ids.numel()
+            input_ids[i, :L] = ids.to(device)
+            attn_mask[i, :L] = 1
+            comp_mask[i, :L] = m.to(device)
 
-        for epoch in range(self.grpo_cfg.update_epochs):
-            for i in my_indices:
-                ro = rollouts[i]
-                metrics = self._loss_one_rollout(
-                    prompt=ro.prompt,
-                    completion=ro.completion,
-                    advantage=adv[i].detach(),
-                )
-                loss = metrics["loss"]
-                loss.backward()
-                total_loss += float(loss.detach())
-                total_kl += metrics["kl"]
-                total_pg += metrics["pg"]
-                n += 1
+        # Targets and shifted completion mask: logits[t] predicts input_ids[t+1].
+        targets = input_ids[:, 1:]                       # [B, T-1]
+        tgt_mask = comp_mask[:, 1:]                       # [B, T-1] (token i predicts comp at i+1)
+
+        # Micro-batch along B to keep the logits tensor (B' × T × V) in memory.
+        # Full-batch forward would materialize ~40 GB of bf16 logits at B=8,
+        # T=16k, V=150k — plus the same for the reference forward — and OOM
+        # the trainer GPU. With MB=2 the per-step peak drops to ~10 GB.
+        mb = max(int(self.grpo_cfg.micro_batch_size), 1)
+        chunks = [list(range(i, min(i + mb, B))) for i in range(0, B, mb)]
+
+        # Memory-efficient per-token logprob: gather target logits and subtract
+        # logsumexp instead of materializing log_softmax over the vocab dim.
+        def _tok_logp(logits_bt_v: torch.Tensor, tgt_bt: torch.Tensor) -> torch.Tensor:
+            gathered = logits_bt_v.gather(-1, tgt_bt.unsqueeze(-1)).squeeze(-1).float()
+            lse = torch.logsumexp(logits_bt_v.float(), dim=-1)
+            return gathered - lse
+
+        total_loss_val = 0.0
+        total_kl_val = 0.0
+        total_pg_val = 0.0
+        total_gn_val = 0.0
+
+        for _ in range(self.grpo_cfg.update_epochs):
+            pg_acc = torch.zeros((), device=device, dtype=torch.float32)
+            kl_acc = torch.zeros((), device=device, dtype=torch.float32)
+            optimizer.zero_grad(set_to_none=True)
+
+            for idxs in chunks:
+                idx_t = torch.tensor(idxs, device=device, dtype=torch.long)
+                in_ids = input_ids.index_select(0, idx_t)
+                am = attn_mask.index_select(0, idx_t)
+                tgt = targets.index_select(0, idx_t)
+                tm = tgt_mask.index_select(0, idx_t)
+                adv_mb = adv.index_select(0, idx_t).unsqueeze(-1)
+
+                # ---- current-policy forward (gradient flows) --------------
+                out = self.model(input_ids=in_ids, attention_mask=am, use_cache=False)
+                tok_logp = _tok_logp(out.logits[:, :-1], tgt)
+
+                # ---- reference forward (adapter disabled, no grad) ---------
+                with torch.no_grad():
+                    with self._peft_model.disable_adapter():
+                        ref_out = self.model(input_ids=in_ids, attention_mask=am, use_cache=False)
+                    ref_tok_logp = _tok_logp(ref_out.logits[:, :-1], tgt)
+
+                # ---- PPO-clipped objective + KL ----------------------------
+                ratio = torch.exp(tok_logp - ref_tok_logp.detach())
+                eps = self.grpo_cfg.epsilon_clip
+                unclipped = ratio * adv_mb
+                clipped = torch.clamp(ratio, 1.0 - eps, 1.0 + eps) * adv_mb
+                pg_per_tok = -torch.min(unclipped, clipped)
+                kl_per_tok = tok_logp - ref_tok_logp
+
+                denom = tm.sum(dim=-1).clamp(min=1.0)
+                pg_per_seq = (pg_per_tok * tm).sum(dim=-1) / denom
+                kl_per_seq = (kl_per_tok * tm).sum(dim=-1) / denom
+                # Scale by chunk size so we get a true mean over the full batch
+                # after summing all chunks' contributions.
+                w = pg_per_seq.numel() / float(B)
+                pg_chunk = pg_per_seq.mean() * w
+                kl_chunk = kl_per_seq.mean() * w
+                loss_chunk = pg_chunk + self.grpo_cfg.beta_kl * kl_chunk
+                loss_chunk.backward()
+                pg_acc = pg_acc + pg_chunk.detach()
+                kl_acc = kl_acc + kl_chunk.detach()
 
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 self._adapter_params(adapter_name),
                 self.grpo_cfg.grad_clip,
             )
-            total_gn += float(grad_norm)
-            n_updates += 1
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
 
-        # Reduce per-rank scalars to a global mean for logging.
-        if self.world_size > 1:
-            t = torch.tensor(
-                [total_loss, total_kl, total_pg, total_gn, float(n), float(n_updates)],
-                device=device,
-            )
-            dist.all_reduce(t, op=dist.ReduceOp.SUM)
-            total_loss, total_kl, total_pg, total_gn, n, n_updates = t.tolist()
+            total_loss_val += float(pg_acc + self.grpo_cfg.beta_kl * kl_acc)
+            total_pg_val += float(pg_acc)
+            total_kl_val += float(kl_acc)
+            total_gn_val += float(grad_norm)
 
+        # Multi-adapter training fragments the cache across problems. Release
+        # cached blocks back to CUDA so the next problem's add_adapter /
+        # save_pretrained can allocate without hitting an OOM on a near-full
+        # but mostly-cached GPU.
+        torch.cuda.empty_cache()
+
+        ne = max(self.grpo_cfg.update_epochs, 1)
         return {
-            "loss": total_loss / max(n, 1),
-            "kl": total_kl / max(n, 1),
-            "pg": total_pg / max(n, 1),
-            "grad_norm": total_gn / max(n_updates, 1),
+            "loss": total_loss_val / ne,
+            "kl": total_kl_val / ne,
+            "pg": total_pg_val / ne,
+            "grad_norm": total_gn_val / ne,
             "reward_mean": float(rewards.mean()),
             "reward_std": float(rewards.std(unbiased=False)) if rewards.numel() > 1 else 0.0,
             "advantage_mean": float(adv.mean()),
         }
-
-    # ---- per-rollout loss --------------------------------------------------
-
-    def _loss_one_rollout(self, *, prompt: str, completion: str, advantage: torch.Tensor) -> dict:
-        """Compute PPO-clipped policy loss + KL for a single (prompt, completion)."""
-        device = self.device
-
-        # Match SGLang's chat-completions sampling: prompt is wrapped as a
-        # single user turn with `add_generation_prompt=True` (adds the
-        # assistant-marker that the rollout was conditioned on). Completion is
-        # the raw assistant text (SGLang strips the <|im_start|>/<|im_end|>
-        # markers around it).
-        try:
-            prompt_ids = self.tokenizer.apply_chat_template(
-                [{"role": "user", "content": prompt}],
-                add_generation_prompt=True,
-                return_tensors="pt",
-            )[0]
-        except Exception:
-            # Fallback for tokenizers without a chat template.
-            prompt_ids = self.tokenizer(prompt, return_tensors="pt", add_special_tokens=False).input_ids[0]
-        comp_ids = self.tokenizer(completion, return_tensors="pt", add_special_tokens=False).input_ids[0]
-        # Truncate (prompt + completion) to max_seq_len, keep the completion intact if possible.
-        max_seq = self.grpo_cfg.max_seq_len
-        if prompt_ids.numel() + comp_ids.numel() > max_seq:
-            keep_comp = min(comp_ids.numel(), max_seq // 2)
-            keep_prompt = max_seq - keep_comp
-            prompt_ids = prompt_ids[-keep_prompt:]
-            comp_ids = comp_ids[:keep_comp]
-
-        input_ids = torch.cat([prompt_ids, comp_ids]).unsqueeze(0).to(device)
-        # Loss is computed over completion tokens only.
-        comp_start = prompt_ids.numel()
-
-        # ---- current-policy logprobs (gradient flows here) -----------------
-        out = self.model(input_ids=input_ids, use_cache=False)
-        logits = out.logits[0, :-1]  # predict t+1 from t
-        targets = input_ids[0, 1:]
-        logprobs = F.log_softmax(logits.float(), dim=-1)
-        tok_logp = logprobs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
-
-        # Mask: only completion positions count.
-        # logits[t] predicts targets[t] = input_ids[t+1]; the first completion target
-        # corresponds to position comp_start in input_ids → index (comp_start - 1) in tok_logp.
-        mask = torch.zeros_like(tok_logp, dtype=torch.float32)
-        mask[comp_start - 1 :] = 1.0
-
-        # ---- reference logprobs (adapter disabled, no grad) ----------------
-        # disable_adapter() lives on the PEFT model; under DDP that's _peft_model.
-        with torch.no_grad():
-            with self._peft_model.disable_adapter():
-                ref_out = self.model(input_ids=input_ids, use_cache=False)
-            ref_logits = ref_out.logits[0, :-1]
-            ref_logprobs = F.log_softmax(ref_logits.float(), dim=-1)
-            ref_tok_logp = ref_logprobs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
-
-        # ---- PPO-clipped objective ----------------------------------------
-        # Reference policy *is* the importance-sampling proposal here (no separate
-        # "old" snapshot per step; for single-update-per-batch this collapses to
-        # importance-sampled policy gradient with clipping).
-        ratio = torch.exp(tok_logp - ref_tok_logp.detach())
-        eps = self.grpo_cfg.epsilon_clip
-        unclipped = ratio * advantage
-        clipped = torch.clamp(ratio, 1.0 - eps, 1.0 + eps) * advantage
-        pg_per_tok = -torch.min(unclipped, clipped)
-
-        # Token-level KL ≈ (logπ - logπ_ref).
-        kl_per_tok = (tok_logp - ref_tok_logp).detach() * 0 + (tok_logp - ref_tok_logp)
-        # Use the masked mean so loss magnitude is independent of sequence length.
-        denom = mask.sum().clamp(min=1.0)
-        pg = (pg_per_tok * mask).sum() / denom
-        kl = (kl_per_tok * mask).sum() / denom
-
-        loss = pg + self.grpo_cfg.beta_kl * kl
-        return {"loss": loss, "kl": float(kl.detach()), "pg": float(pg.detach())}

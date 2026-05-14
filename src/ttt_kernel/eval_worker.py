@@ -74,8 +74,15 @@ def main() -> None:
         sys.path.insert(0, repo_path)
 
     try:
-        from kernelbench.utils import set_gpu_arch
-        set_gpu_arch([gpu_arch])
+        from kernelbench.utils import set_gpu_arch, NVIDIA_ARCHS
+        if gpu_arch in NVIDIA_ARCHS:
+            set_gpu_arch([gpu_arch])
+        else:
+            # Direct nvcc arch like "10.0a" or "sm_100a" — bypass KB lookup.
+            tcl = gpu_arch.replace("sm_", "").replace("_", ".")
+            if tcl and tcl[0].isdigit() and "." not in tcl:
+                tcl = tcl[:-1] + "." + tcl[-1] if not tcl[-1].isalpha() else tcl[:-2] + "." + tcl[-2:]
+            os.environ["TORCH_CUDA_ARCH_LIST"] = tcl
         from kernelbench.eval import eval_kernel_against_ref, get_torch_dtype_from_string
         dtype = get_torch_dtype_from_string(precision)
     except Exception as e:  # noqa: BLE001

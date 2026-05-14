@@ -85,8 +85,21 @@ class KernelEnv:
 
         # We still import the lightweight pieces (dataset, prompt builder,
         # code extractor) in-process; only the HEAVY eval lives in a subprocess.
-        from kernelbench.utils import set_gpu_arch  # noqa: WPS433
-        set_gpu_arch([cfg.gpu_arch])
+        # KernelBench's set_gpu_arch only accepts named archs (Blackwell, Ada,
+        # ...) and expands "Blackwell" to all 4 Blackwell sm variants, making
+        # nvcc do 4× the work. If the user passes a numeric arch like "10.0a"
+        # or "sm_100a", bypass set_gpu_arch and set TORCH_CUDA_ARCH_LIST
+        # directly.
+        from kernelbench.utils import set_gpu_arch, NVIDIA_ARCHS  # noqa: WPS433
+        arch = cfg.gpu_arch
+        if arch in NVIDIA_ARCHS:
+            set_gpu_arch([arch])
+        else:
+            tcl = arch.replace("sm_", "").replace("_", ".")
+            if tcl and tcl[0].isdigit() and "." not in tcl:
+                # "100a" → "10.0a", "90" → "9.0"
+                tcl = tcl[:-1] + "." + tcl[-1] if not tcl[-1].isalpha() else tcl[:-2] + "." + tcl[-2:]
+            os.environ["TORCH_CUDA_ARCH_LIST"] = tcl
         from kernelbench import dataset as kb_dataset
         from kernelbench import prompt_constructor_toml as kb_prompts
         from kernelbench.utils import extract_first_code
@@ -101,15 +114,11 @@ class KernelEnv:
             dataset_name=cfg.dataset_name,
         )
 
-        # ONE sandbox subprocess per KernelEnv instance (per pair). All
-        # concurrent problems share it; the worker holds an asyncio.Lock
-        # around evaluate() so the dispatches are serialized. We had a
-        # per-problem sandbox design earlier, but each sandbox creates its
-        # own CUDA context (~3 GB) on the trainer GPU — with P=10 inflight
-        # that wiped out the entire trainer GPU. nvcc compile is CPU-bound
-        # but the GPU-side correctness/perf trials serialize anyway, so the
-        # per-problem variant gave very little throughput and a lot of risk.
-        self._eval_proc: Optional[subprocess.Popen] = None
+        # Sandbox pool keyed by (problem_id, slot). Each problem opens K=num_samples
+        # sandboxes at start so all K rollouts of a turn can nvcc-compile in
+        # parallel. Each sandbox owns ~3 GB of CUDA context on the trainer GPU,
+        # so total memory = P × K × 3 GB where P=max_inflight_per_pair, K=num_samples.
+        self._sandboxes: dict[tuple[int, int], subprocess.Popen] = {}
         self._sandbox_log_path: Optional[str] = os.environ.get("TTT_SANDBOX_LOG")
 
     # ---- problem listing ----------------------------------------------------
@@ -179,63 +188,112 @@ class KernelEnv:
             raise RuntimeError(f"eval sandbox failed to init: {ready}")
         return proc
 
-    def open_sandbox(self, problem_id: int = 0) -> None:
-        """Ensure the shared eval sandbox is alive. problem_id is ignored
-        (kept in the signature so callers can stay problem-aware)."""
-        if self._eval_proc is not None and self._eval_proc.poll() is None:
+    def open_sandboxes(self, problem_id: int, n: int) -> None:
+        """Spawn `n` per-rollout sandboxes for this problem. Spawn is SERIAL
+        because each sandbox grabs ~3 GB of CUDA driver+allocator memory on
+        init, and parallel spawn produces a burst that OOMs the trainer GPU.
+        Serial cost is ~n × 2s; bounded peak memory."""
+        for slot in range(n):
+            key = (problem_id, slot)
+            existing = self._sandboxes.get(key)
+            if existing is not None and existing.poll() is None:
+                continue
+            self._sandboxes[key] = self._spawn_one()
+
+    def close_sandboxes(self, problem_id: int) -> None:
+        """Tear down all sandboxes belonging to this problem."""
+        keys = [k for k in list(self._sandboxes.keys()) if k[0] == problem_id]
+        for k in keys:
+            proc = self._sandboxes.pop(k, None)
+            if proc is None:
+                continue
+            try:
+                proc.stdin.write(json.dumps({"cmd": "exit"}) + "\n")
+                proc.stdin.flush()
+                proc.wait(timeout=10)
+            except Exception:
+                proc.kill()
+
+    # Back-compat single-sandbox shims (slot defaults to 0). Anything that
+    # still calls open_sandbox(pid) will get one sandbox at slot 0.
+    def open_sandbox(self, problem_id: int, slot: int = 0) -> None:
+        key = (problem_id, slot)
+        existing = self._sandboxes.get(key)
+        if existing is not None and existing.poll() is None:
             return
-        self._eval_proc = self._spawn_one()
+        self._sandboxes[key] = self._spawn_one()
 
-    def close_sandbox(self, problem_id: int = 0) -> None:
-        """No-op if other problems are still running on the same pair.
-        Use close() to actually tear down the shared sandbox."""
-        return
-
-    def _eval_via_sandbox(self, problem_id: int, ref_src: str, kernel_src: str) -> dict:
-        """Send one evaluate request, return parsed reply. Auto-respawns on death.
-
-        Caller is responsible for serializing concurrent evaluate() calls
-        against this single shared sandbox via an asyncio.Lock.
-        """
+    def close_sandbox(self, problem_id: int, slot: int = 0) -> None:
+        proc = self._sandboxes.pop((problem_id, slot), None)
+        if proc is None:
+            return
         try:
-            if self._eval_proc is None or self._eval_proc.poll() is not None:
-                self._eval_proc = self._spawn_one()
+            proc.stdin.write(json.dumps({"cmd": "exit"}) + "\n")
+            proc.stdin.flush()
+            proc.wait(timeout=10)
+        except Exception:
+            proc.kill()
+
+    def _eval_via_sandbox(self, problem_id: int, slot: int, ref_src: str, kernel_src: str) -> dict:
+        """Send one evaluate request to (problem_id, slot)'s sandbox.
+        Auto-respawns on death. Different slots are independent subprocesses,
+        so this is safe to call from K threads in parallel for one problem.
+        """
+        key = (problem_id, slot)
+        try:
+            proc = self._sandboxes.get(key)
+            if proc is None or proc.poll() is not None:
+                self._sandboxes.pop(key, None)
+                self.open_sandbox(problem_id, slot)
+                proc = self._sandboxes[key]
             req = json.dumps({"cmd": "evaluate", "ref_src": ref_src, "custom_src": kernel_src})
-            self._eval_proc.stdin.write(req + "\n")
-            self._eval_proc.stdin.flush()
-            line = self._eval_proc.stdout.readline()
+            proc.stdin.write(req + "\n")
+            proc.stdin.flush()
+            line = proc.stdout.readline()
             if not line:
-                rc = self._eval_proc.poll()
-                self._eval_proc = None
+                rc = proc.poll()
+                self._sandboxes.pop(key, None)
                 return {
                     "status": "sandbox_died",
                     "error": f"sandbox stdout closed (returncode={rc})",
                 }
             return json.loads(line)
         except (BrokenPipeError, ConnectionResetError) as e:
-            self._eval_proc = None
+            self._sandboxes.pop(key, None)
             return {"status": "sandbox_died", "error": str(e)}
         except Exception as e:  # noqa: BLE001
-            self._eval_proc = None
+            self._sandboxes.pop(key, None)
             return {"status": "sandbox_died", "error": str(e),
                     "traceback": traceback.format_exc()}
 
     def close(self) -> None:
-        if self._eval_proc is None:
-            return
-        try:
-            self._eval_proc.stdin.write(json.dumps({"cmd": "exit"}) + "\n")
-            self._eval_proc.stdin.flush()
-            self._eval_proc.wait(timeout=10)
-        except Exception:
-            self._eval_proc.kill()
-        self._eval_proc = None
+        for k in list(self._sandboxes.keys()):
+            proc = self._sandboxes.pop(k, None)
+            if proc is None:
+                continue
+            try:
+                proc.stdin.write(json.dumps({"cmd": "exit"}) + "\n")
+                proc.stdin.flush()
+                proc.wait(timeout=10)
+            except Exception:
+                proc.kill()
 
     # ---- the actual reward call --------------------------------------------
 
-    def evaluate(self, problem: Problem, raw_completion: str) -> RolloutResult:
+    def evaluate(self, problem: Problem, raw_completion: str, slot: int = 0) -> RolloutResult:
         """Score one rollout. Never raises — failures become negative reward + feedback."""
-        kernel_src = self._extract(raw_completion, ["python", "cpp"])
+        # Thinking models (Qwen3-4B-Thinking-2507) emit chain-of-thought
+        # wrapped in `<think>...</think>` before the final answer. The CoT
+        # often contains draft `\`\`\`python ...\`\`\`` blocks that the model
+        # self-rejects, then writes the real kernel after `</think>`. Without
+        # this strip, `extract_first_code` would grab the rejected draft and
+        # score the model on its own discarded attempt — ~19% of rollouts in
+        # an empirical audit. Extract from the post-think portion only.
+        if "</think>" in raw_completion:
+            post_think = raw_completion.rsplit("</think>", 1)[1]
+        else:
+            post_think = raw_completion
+        kernel_src = self._extract(post_think, ["python", "cpp"])
         if not kernel_src:
             return RolloutResult(
                 raw_completion=raw_completion,
@@ -250,7 +308,7 @@ class KernelEnv:
                 error_kind="parse",
             )
 
-        reply = self._eval_via_sandbox(problem.problem_id, problem.ref_src, kernel_src)
+        reply = self._eval_via_sandbox(problem.problem_id, slot, problem.ref_src, kernel_src)
         status = reply.get("status")
 
         if status == "ok":
