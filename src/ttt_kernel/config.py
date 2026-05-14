@@ -80,9 +80,34 @@ class GRPOCfg(BaseModel):
     max_seq_len: int = 8192
 
 
+class StageParallelCfg(BaseModel):
+    """Parallelism knobs for one stage (sampler or trainer) of one pair."""
+    dp: int = 1
+    tp: int = 1
+    sp: int = 1  # currently reserved; not yet wired (no SGLang/torch hook for it)
+
+
+class PoolCfg(BaseModel):
+    """Pool of (sampler, trainer) pairs.
+
+    Each pair owns its own SGLang server + its own trainer subprocess + its
+    own adapter directory. The orchestrator dispatches problems to free pairs
+    asynchronously; within a pair, each problem runs num_turns of
+    rollout+grpo+hot-swap against ITS paired SGLang. Total GPUs needed =
+    num_pairs * (sampler.dp*tp*sp + trainer.dp*tp*sp).
+    """
+    num_pairs: int = 1
+    sampler: StageParallelCfg = StageParallelCfg()
+    trainer: StageParallelCfg = StageParallelCfg()
+    base_port: int = 30000
+
+
 class LoopCfg(BaseModel):
     num_turns: int = 5
     persist_adapter_across_problems: bool = False
+    # How many problems to train on jointly per adapter (one batch of problems
+    # gets its own fresh adapter, trained for num_turns turns over all of them).
+    problem_batch_size: int = 1
     seed: int = 0
 
 
@@ -113,6 +138,7 @@ class Config(BaseModel):
     grpo: GRPOCfg = GRPOCfg()
     loop: LoopCfg = LoopCfg()
     logging: LoggingCfg = LoggingCfg()
+    pool: PoolCfg = PoolCfg()
 
 
 def _set_nested(d: dict, dotted: str, value: Any) -> None:

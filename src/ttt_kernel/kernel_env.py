@@ -8,12 +8,19 @@ We treat each KernelBench problem as an MDP with a single step:
 
 This module isolates all KernelBench imports and gpu-arch / env-var setup so the
 trainer/rollout code never has to touch it directly.
+
+Eval runs in a sandbox subprocess (ttt_kernel.eval_worker). That process owns
+its own CUDA context on the trainer GPU; if an LLM-generated kernel triggers
+an illegal-memory-access or otherwise poisons CUDA, only the sandbox dies and
+the parent transparently respawns it. The trainer's CUDA context stays clean.
 """
 from __future__ import annotations
 
 import dataclasses
+import json
 import math
 import os
+import subprocess
 import sys
 import traceback
 from dataclasses import dataclass
@@ -38,6 +45,16 @@ class Problem:
     name: str
     ref_src: str    # PyTorch reference module source
     prompt: str     # Full prompt string to feed the LLM
+
+
+@dataclass
+class _ReplyShim:
+    """Adapter so the sandbox JSON reply quacks like a KernelBench eval result."""
+    compiled: bool
+    correctness: bool
+    runtime: float
+    ref_runtime: float
+    feedback: str
 
 
 @dataclass
@@ -66,28 +83,29 @@ class KernelEnv:
         self.reward_cfg = reward_cfg
         _add_kernelbench_to_path(cfg.repo_path)
 
-        # Imports deferred until after path setup.
+        # We still import the lightweight pieces (dataset, prompt builder,
+        # code extractor) in-process; only the HEAVY eval lives in a subprocess.
         from kernelbench.utils import set_gpu_arch  # noqa: WPS433
         set_gpu_arch([cfg.gpu_arch])
-
-        # Cache module references — they're heavy.
         from kernelbench import dataset as kb_dataset
-        from kernelbench import eval as kb_eval
         from kernelbench import prompt_constructor_toml as kb_prompts
         from kernelbench.utils import extract_first_code
-        from kernelbench.eval import get_torch_dtype_from_string
 
         self._construct = kb_dataset.construct_kernelbench_dataset
-        self._eval_kernel = kb_eval.eval_kernel_against_ref
         self._get_prompt = kb_prompts.get_prompt_for_backend
         self._extract = extract_first_code
-        self._dtype = get_torch_dtype_from_string(cfg.precision)
 
         self._dataset = self._construct(
             level=cfg.level,
             source=cfg.dataset_src,
             dataset_name=cfg.dataset_name,
         )
+
+        # Sandbox subprocess handle; spawned lazily on first evaluate() call.
+        self._eval_proc: Optional[subprocess.Popen] = None
+        # Stash a pointer to our own stderr so we can dump the sandbox's
+        # stderr logs into a sibling stream if useful.
+        self._sandbox_log_path: Optional[str] = os.environ.get("TTT_SANDBOX_LOG")
 
     # ---- problem listing ----------------------------------------------------
 
@@ -114,6 +132,97 @@ class KernelEnv:
             prompt=prompt,
         )
 
+    # ---- eval subprocess plumbing ------------------------------------------
+
+    def _spawn_sandbox(self) -> None:
+        """(Re)spawn the eval subprocess. Sends the init config and waits for ready."""
+        stderr_target: int | object
+        if self._sandbox_log_path:
+            # Append-mode log; persists across respawns for forensic value.
+            stderr_target = open(self._sandbox_log_path, "a", buffering=1)
+        else:
+            stderr_target = subprocess.DEVNULL
+
+        # Inherit env (esp. CUDA_VISIBLE_DEVICES + TORCH_EXTENSIONS_DIR which the
+        # orchestrator already set on the trainer-worker process).
+        env = os.environ.copy()
+        # Make sure the package is importable.
+        repo_src = os.path.join(os.path.dirname(os.path.dirname(__file__)))
+        env["PYTHONPATH"] = repo_src + os.pathsep + env.get("PYTHONPATH", "")
+
+        proc = subprocess.Popen(
+            [sys.executable, "-u", "-m", "ttt_kernel.eval_worker"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=stderr_target,
+            env=env,
+            text=True,
+            bufsize=1,
+        )
+        init = {
+            "repo_path": self.cfg.repo_path,
+            "gpu_arch": self.cfg.gpu_arch,
+            "backend": self.cfg.backend,
+            "precision": self.cfg.precision,
+            "timing_method": self.cfg.timing_method,
+            "num_correct_trials": self.cfg.num_correct_trials,
+            "num_perf_trials": self.cfg.num_perf_trials,
+        }
+        proc.stdin.write(json.dumps(init) + "\n")
+        proc.stdin.flush()
+        ready_line = proc.stdout.readline()
+        if not ready_line:
+            raise RuntimeError("eval sandbox closed stdout before sending ready")
+        ready = json.loads(ready_line)
+        if ready.get("status") != "ready":
+            raise RuntimeError(f"eval sandbox failed to init: {ready}")
+        self._eval_proc = proc
+
+    def _ensure_sandbox(self) -> None:
+        if self._eval_proc is not None and self._eval_proc.poll() is None:
+            return
+        self._eval_proc = None
+        self._spawn_sandbox()
+
+    def _eval_via_sandbox(self, ref_src: str, kernel_src: str) -> dict:
+        """Send one evaluate request, return parsed reply.
+
+        On any pipe failure / dead sandbox, returns a synthetic exception reply
+        and lets the next call respawn.
+        """
+        try:
+            self._ensure_sandbox()
+            assert self._eval_proc is not None
+            req = json.dumps({"cmd": "evaluate", "ref_src": ref_src, "custom_src": kernel_src})
+            self._eval_proc.stdin.write(req + "\n")
+            self._eval_proc.stdin.flush()
+            line = self._eval_proc.stdout.readline()
+            if not line:
+                rc = self._eval_proc.poll()
+                self._eval_proc = None
+                return {
+                    "status": "sandbox_died",
+                    "error": f"sandbox stdout closed (returncode={rc})",
+                }
+            return json.loads(line)
+        except (BrokenPipeError, ConnectionResetError) as e:
+            self._eval_proc = None
+            return {"status": "sandbox_died", "error": str(e)}
+        except Exception as e:  # noqa: BLE001
+            self._eval_proc = None
+            return {"status": "sandbox_died", "error": str(e),
+                    "traceback": traceback.format_exc()}
+
+    def close(self) -> None:
+        if self._eval_proc is not None:
+            try:
+                self._eval_proc.stdin.write(json.dumps({"cmd": "exit"}) + "\n")
+                self._eval_proc.stdin.flush()
+                self._eval_proc.wait(timeout=10)
+            except Exception:
+                self._eval_proc.kill()
+            self._eval_proc = None
+
     # ---- the actual reward call --------------------------------------------
 
     def evaluate(self, problem: Problem, raw_completion: str) -> RolloutResult:
@@ -133,40 +242,58 @@ class KernelEnv:
                 error_kind="parse",
             )
 
-        try:
-            kb_res = self._eval_kernel(
-                original_model_src=problem.ref_src,
-                custom_model_src=kernel_src,
-                verbose=False,
-                measure_performance=True,
-                timing_method=self.cfg.timing_method,
-                num_correct_trials=self.cfg.num_correct_trials,
-                num_perf_trials=self.cfg.num_perf_trials,
-                backend=self.cfg.backend,
-                precision=self._dtype,
-            )
-        except Exception:  # noqa: BLE001 — KB can raise on bad code; treat as error
-            tb = traceback.format_exc(limit=20)
+        reply = self._eval_via_sandbox(problem.ref_src, kernel_src)
+        status = reply.get("status")
+
+        if status == "ok":
+            return self._score_primitive(raw_completion, kernel_src, reply)
+
+        if status == "harness_none":
             return RolloutResult(
-                raw_completion=raw_completion,
-                kernel_src=kernel_src,
+                raw_completion=raw_completion, kernel_src=kernel_src,
                 compiled=False, correct=False, speedup=-1.0,
                 runtime_ms=-1.0, ref_runtime_ms=-1.0,
                 reward=self.reward_cfg.error_penalty,
-                feedback=f"[harness-error] eval_kernel_against_ref raised:\n{tb}",
+                feedback="[harness-error] eval_kernel_against_ref returned None (likely nvcc abort or missing .so).",
                 error_kind="compile",
             )
 
-        return self._score(raw_completion, kernel_src, kb_res)
+        # exception or sandbox_died
+        err = reply.get("error", "unknown")
+        tb = reply.get("traceback", "")
+        tag = "[sandbox-died]" if status == "sandbox_died" else "[harness-error]"
+        fb = f"{tag} eval_kernel_against_ref raised:\n{err}\n{tb}".strip()
+        return RolloutResult(
+            raw_completion=raw_completion,
+            kernel_src=kernel_src,
+            compiled=False, correct=False, speedup=-1.0,
+            runtime_ms=-1.0, ref_runtime_ms=-1.0,
+            reward=self.reward_cfg.error_penalty,
+            feedback=fb,
+            error_kind="compile",
+        )
 
     # ---- scoring ------------------------------------------------------------
+
+    def _score_primitive(self, raw_completion: str, kernel_src: str, reply: dict) -> RolloutResult:
+        """Same logic as _score, but inputs are the JSON fields from the sandbox."""
+        return self._score(
+            raw_completion, kernel_src,
+            _ReplyShim(
+                compiled=reply.get("compiled", False),
+                correctness=reply.get("correctness", False),
+                runtime=reply.get("runtime", -1.0),
+                ref_runtime=reply.get("ref_runtime", -1.0),
+                feedback=reply.get("feedback", ""),
+            ),
+        )
 
     def _score(self, raw_completion: str, kernel_src: str, kb_res) -> RolloutResult:
         compiled = bool(kb_res.compiled)
         correct = bool(kb_res.correctness)
         runtime = float(kb_res.runtime)
         ref_runtime = float(kb_res.ref_runtime)
-        feedback = kb_res.summarize_for_feedback()
+        feedback = kb_res.summarize_for_feedback() if hasattr(kb_res, "summarize_for_feedback") else kb_res.feedback
 
         if not compiled:
             return RolloutResult(

@@ -11,6 +11,10 @@ hands us K rollouts (token strings + rewards). We:
   6. AdamW step, grad clip.
   7. Save adapter to disk so SGLang can hot-reload it.
 
+Distributed: when launched under torchrun (WORLD_SIZE > 1), we wrap the policy
+in DDP so multiple ranks share the gradient computation. Rollouts are sliced
+across ranks; DDP's backward-hook all-reduce keeps weights in sync.
+
 Notes:
 - The reference logprobs are computed from the SAME HF model with the adapter
   disabled (PEFT `with adapter.disable()`), so we don't need a second model in VRAM.
@@ -26,8 +30,10 @@ from dataclasses import dataclass
 from typing import List, Optional
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from peft import LoraConfig, PeftModel, get_peft_model
+from torch.nn.parallel import DistributedDataParallel as DDP
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
@@ -42,11 +48,27 @@ def _dtype_from_str(s: str) -> torch.dtype:
     return {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}[s]
 
 
+def _init_distributed() -> tuple[int, int, int]:
+    """Initialize torch.distributed if launched under torchrun; return (rank, world, local_rank)."""
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        rank = int(os.environ["RANK"])
+        world = int(os.environ["WORLD_SIZE"])
+        local_rank = int(os.environ.get("LOCAL_RANK", rank))
+        if not dist.is_initialized():
+            dist.init_process_group(backend="nccl")
+        torch.cuda.set_device(local_rank)
+        return rank, world, local_rank
+    return 0, 1, 0
+
+
 class GRPOLoRATrainer:
     def __init__(self, model_cfg, lora_cfg, grpo_cfg):
         self.model_cfg = model_cfg
         self.lora_cfg = lora_cfg
         self.grpo_cfg = grpo_cfg
+
+        self.rank, self.world_size, self.local_rank = _init_distributed()
+        self.device = torch.device(f"cuda:{self.local_rank}")
 
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_cfg.name, trust_remote_code=model_cfg.trust_remote_code
@@ -67,9 +89,23 @@ class GRPOLoRATrainer:
             bias=lora_cfg.bias,
             task_type="CAUSAL_LM",
         )
-        self.model: PeftModel = get_peft_model(base, peft_config)
-        self.model.cuda()
-        self.model.train()
+        peft_model: PeftModel = get_peft_model(base, peft_config)
+        peft_model.to(self.device)
+        peft_model.train()
+        self._peft_model = peft_model  # unwrapped; used for save/disable_adapter
+
+        if self.world_size > 1:
+            # find_unused_parameters: PEFT freezes most base params, so DDP needs
+            # to be told that's expected. gradient_as_bucket_view saves memory.
+            self.model = DDP(
+                peft_model,
+                device_ids=[self.local_rank],
+                output_device=self.local_rank,
+                find_unused_parameters=True,
+                gradient_as_bucket_view=True,
+            )
+        else:
+            self.model = peft_model
 
         # Optimizer over LoRA params only.
         self.optimizer = torch.optim.AdamW(
@@ -87,32 +123,66 @@ class GRPOLoRATrainer:
         # ("LoRA serving currently doesn't support adapters that add tokens"),
         # even when those tokens are part of the BASE tokenizer (e.g. Qwen3-
         # Thinking's <think>/</think>). Tokenizer files live with the base model.
-        self.model.save_pretrained(out_dir)
+        # Only rank 0 writes; other ranks wait at a barrier so the next
+        # reload_adapter call sees a complete adapter on disk.
+        if self.rank == 0:
+            self._peft_model.save_pretrained(out_dir)
+        if self.world_size > 1:
+            dist.barrier()
         return out_dir
 
     def reset_adapter(self) -> None:
-        """Re-init LoRA weights to zero-effect (for fresh-per-problem mode)."""
-        for name, p in self.model.named_parameters():
-            if "lora_A" in name:
-                torch.nn.init.kaiming_uniform_(p, a=5 ** 0.5)
-            elif "lora_B" in name:
-                torch.nn.init.zeros_(p)
+        """Re-init LoRA weights to zero-effect (for fresh-per-problem mode).
+
+        Under DDP we only init on rank 0 (kaiming_uniform_ draws from each
+        rank's RNG independently — they would diverge otherwise), then
+        broadcast the LoRA params to keep replicas bit-identical.
+        """
+        if self.rank == 0:
+            for name, p in self._peft_model.named_parameters():
+                if "lora_A" in name:
+                    torch.nn.init.kaiming_uniform_(p, a=5 ** 0.5)
+                elif "lora_B" in name:
+                    torch.nn.init.zeros_(p)
+        if self.world_size > 1:
+            for name, p in self._peft_model.named_parameters():
+                if "lora_A" in name or "lora_B" in name:
+                    dist.broadcast(p.data, src=0)
+            dist.barrier()
 
     # ---- one GRPO step over K rollouts -------------------------------------
 
-    def step(self, rollouts: List[Rollout]) -> dict:
-        """One GRPO update from a group of K rollouts on the SAME prompt.
+    def step(self, rollouts: List[Rollout], group_ids: Optional[List[int]] = None) -> dict:
+        """One GRPO update from a flat list of rollouts, optionally split into groups.
+
+        When `group_ids` is provided, advantages are computed PER group (so the
+        baseline is per-problem). Under multi-problem batching this is essential
+        — a single global baseline across problems would couple their rewards.
 
         Returns a dict of scalar metrics for logging.
         """
-        device = next(self.model.parameters()).device
+        device = self.device
         rewards = torch.tensor([r.reward for r in rollouts], dtype=torch.float32, device=device)
 
-        # Group-relative advantage.
-        if self.grpo_cfg.group_advantage_norm and rewards.numel() > 1:
-            adv = (rewards - rewards.mean()) / (rewards.std(unbiased=False) + 1e-6)
-        else:
-            adv = rewards - rewards.mean()
+        if group_ids is None:
+            group_ids = [0] * len(rollouts)
+        assert len(group_ids) == len(rollouts)
+
+        # Per-group advantage normalization (GRPO baseline is per-group).
+        adv = torch.zeros_like(rewards)
+        unique_groups = sorted(set(group_ids))
+        for g in unique_groups:
+            idx = [i for i, gi in enumerate(group_ids) if gi == g]
+            idx_t = torch.tensor(idx, device=device, dtype=torch.long)
+            r_g = rewards[idx_t]
+            if self.grpo_cfg.group_advantage_norm and r_g.numel() > 1:
+                a = (r_g - r_g.mean()) / (r_g.std(unbiased=False) + 1e-6)
+            else:
+                a = r_g - r_g.mean()
+            adv[idx_t] = a
+
+        # Slice rollouts across ranks for data-parallel training.
+        my_indices = list(range(self.rank, len(rollouts), self.world_size))
 
         total_loss = 0.0
         total_kl = 0.0
@@ -120,7 +190,8 @@ class GRPOLoRATrainer:
         n = 0
 
         for epoch in range(self.grpo_cfg.update_epochs):
-            for i, ro in enumerate(rollouts):
+            for i in my_indices:
+                ro = rollouts[i]
                 metrics = self._loss_one_rollout(
                     prompt=ro.prompt,
                     completion=ro.completion,
@@ -140,6 +211,12 @@ class GRPOLoRATrainer:
             self.optimizer.step()
             self.optimizer.zero_grad(set_to_none=True)
 
+        # Reduce per-rank scalars to a global mean for logging.
+        if self.world_size > 1:
+            t = torch.tensor([total_loss, total_kl, total_pg, float(n)], device=device)
+            dist.all_reduce(t, op=dist.ReduceOp.SUM)
+            total_loss, total_kl, total_pg, n = t.tolist()
+
         return {
             "loss": total_loss / max(n, 1),
             "kl": total_kl / max(n, 1),
@@ -153,9 +230,22 @@ class GRPOLoRATrainer:
 
     def _loss_one_rollout(self, *, prompt: str, completion: str, advantage: torch.Tensor) -> dict:
         """Compute PPO-clipped policy loss + KL for a single (prompt, completion)."""
-        device = next(self.model.parameters()).device
+        device = self.device
 
-        prompt_ids = self.tokenizer(prompt, return_tensors="pt", add_special_tokens=False).input_ids[0]
+        # Match SGLang's chat-completions sampling: prompt is wrapped as a
+        # single user turn with `add_generation_prompt=True` (adds the
+        # assistant-marker that the rollout was conditioned on). Completion is
+        # the raw assistant text (SGLang strips the <|im_start|>/<|im_end|>
+        # markers around it).
+        try:
+            prompt_ids = self.tokenizer.apply_chat_template(
+                [{"role": "user", "content": prompt}],
+                add_generation_prompt=True,
+                return_tensors="pt",
+            )[0]
+        except Exception:
+            # Fallback for tokenizers without a chat template.
+            prompt_ids = self.tokenizer(prompt, return_tensors="pt", add_special_tokens=False).input_ids[0]
         comp_ids = self.tokenizer(completion, return_tensors="pt", add_special_tokens=False).input_ids[0]
         # Truncate (prompt + completion) to max_seq_len, keep the completion intact if possible.
         max_seq = self.grpo_cfg.max_seq_len
@@ -183,8 +273,9 @@ class GRPOLoRATrainer:
         mask[comp_start - 1 :] = 1.0
 
         # ---- reference logprobs (adapter disabled, no grad) ----------------
+        # disable_adapter() lives on the PEFT model; under DDP that's _peft_model.
         with torch.no_grad():
-            with self.model.disable_adapter():
+            with self._peft_model.disable_adapter():
                 ref_out = self.model(input_ids=input_ids, use_cache=False)
             ref_logits = ref_out.logits[0, :-1]
             ref_logprobs = F.log_softmax(ref_logits.float(), dim=-1)

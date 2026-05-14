@@ -2,7 +2,7 @@
 # Override any field on the CLI:  python scripts/inference.py --config configs/default.yaml model.name=Qwen/Qwen3-4B
 
 model:
-  name: Qwen/Qwen3-4B-Thinking-2507
+  name: Qwen/Qwen3-4B-Instruct-2507
   dtype: bfloat16
   trust_remote_code: true
 
@@ -41,7 +41,7 @@ kernelbench:
   gpu_arch: Blackwell
   prompt_option: one_shot
   num_correct_trials: 5
-  num_perf_trials: 100
+  num_perf_trials: 20
   timing_method: cuda_event
   # Hard wall-clock budget per single rollout eval (seconds). Bad kernels can hang.
   eval_timeout_s: 120
@@ -67,11 +67,28 @@ grpo:
   max_seq_len: 8192            # truncate the (prompt + completion) for the loss pass
 
 loop:
-  num_turns: 5                 # multi-turn online RL: turns per problem
-  # If true, keep the adapter learned on problem N when starting problem N+1.
-  # If false, reset to the base model at the start of each problem.
+  num_turns: 5                 # multi-turn online RL: turns per (batch of) problem(s)
+  # If true, keep the adapter learned on batch N when starting batch N+1.
+  # If false, reset to the base model at the start of each batch.
   persist_adapter_across_problems: false
+  # Train one adapter jointly on this many problems at a time.
+  problem_batch_size: 8
   seed: 0
+
+pool:
+  # Number of (sampler, trainer) pairs. Each pair is independent and processes
+  # one problem at a time over num_turns turns of online RL with LoRA hot-swap.
+  num_pairs: 4
+  sampler:
+    dp: 1
+    tp: 1
+    sp: 1
+  trainer:
+    dp: 1
+    tp: 1
+    sp: 1
+  # First SGLang port; subsequent pairs use base_port+i (skipping in-use ports).
+  base_port: 30000
 
 logging:
   out_dir: ./runs
