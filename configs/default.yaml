@@ -75,26 +75,6 @@ loop:
   problem_batch_size: 8
   seed: 0
 
-pool:
-  # Number of (sampler, trainer) pairs. Each pair is independent and processes
-  # one problem at a time over num_turns turns of online RL with LoRA hot-swap.
-  num_pairs: 4
-  sampler:
-    dp: 1
-    tp: 1
-    sp: 1
-  trainer:
-    dp: 1
-    tp: 1
-    sp: 1
-  # First SGLang port; subsequent pairs use base_port+i (skipping in-use ports).
-  base_port: 30000
-  # Max in-flight problems per pair. Orchestrator assigns to the least-loaded
-  # pair until each is full; new problems start as soon as one completes.
-  max_inflight_per_pair: 10
-  # Max number of LoRAs SGLang can keep registered/batched at once.
-  sglang_max_loras: 16
-
 logging:
   out_dir: ./runs
   run_name: null               # auto: ttt_<timestamp>
