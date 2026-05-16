@@ -21,6 +21,8 @@ dependencies = [
     "httpx",
     "openai",
     "wandb",
+    "fastapi>=0.111",
+    "uvicorn[standard]>=0.30",
     # KernelBench is installed as a path dependency (see README).
 ]
 
