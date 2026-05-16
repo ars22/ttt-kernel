@@ -94,22 +94,10 @@ async def _run_one_problem(
             trainer.delete_problem_adapter(adapter_name)
         return
 
-    # Per-rollout sandbox: K sandboxes per problem so all K kernels of a turn
-    # nvcc-compile in parallel. With max_inflight_per_pair=1, only one set of
-    # K sandboxes lives on a trainer GPU at a time → memory bounded.
+    # Per-rollout sandboxes are spawned ONCE per turn (around eval only) and
+    # torn down before the GRPO step, so the trainer step gets the full GPU
+    # without competing with 8 sandbox CUDA contexts. See the turn loop below.
     K = cfg.rollout.num_samples
-    try:
-        env.open_sandboxes(problem_id, n=K)
-    except Exception as e:
-        _emit({"kind": "done", "pair": pair_idx, "problem_id": problem_id,
-               "error": f"open_sandbox failed: {e}",
-               "traceback": traceback.format_exc()})
-        try:
-            await sglang.unload_adapter_async(adapter_name)
-        finally:
-            async with trainer_lock:
-                trainer.delete_problem_adapter(adapter_name)
-        return
 
     problem = env.get_problem(problem_id)
     # K already bound above for open_sandboxes.
@@ -129,17 +117,24 @@ async def _run_one_problem(
                 adapter_name=adapter_name,
             )
 
-            # --- evaluate: K parallel evaluate() calls, one per rollout slot.
-            # Each rollout has its own sandbox subprocess so nvcc compiles
-            # run in parallel across the K rollouts on CPU cores.
+            # --- evaluate: spawn K sandboxes RIGHT NOW (serial, ~16s), run
+            # K parallel evaluate() calls (nvcc compiles in parallel), then
+            # tear them down before the trainer step so the GRPO forward+
+            # backward has the full trainer GPU.
             loop = asyncio.get_running_loop()
-            results = await asyncio.gather(*[
-                loop.run_in_executor(
-                    None,
-                    lambda g=g, s=k: env.evaluate(problem, g.text, slot=s),
-                )
-                for k, g in enumerate(gens)
-            ])
+            await loop.run_in_executor(None, lambda: env.open_sandboxes(problem_id, n=K))
+            try:
+                results = await asyncio.gather(*[
+                    loop.run_in_executor(
+                        None,
+                        lambda g=g, s=k: env.evaluate(problem, g.text, slot=s),
+                    )
+                    for k, g in enumerate(gens)
+                ])
+            finally:
+                # Always tear down sandboxes after eval — they hold ~80 GB
+                # of CUDA context on the trainer GPU which the step needs.
+                await loop.run_in_executor(None, lambda: env.close_sandboxes(problem_id))
 
             for k, r in enumerate(results):
                 rec = {
@@ -221,6 +216,9 @@ async def _run_one_problem(
         _emit({"kind": "done", "pair": pair_idx, "problem_id": problem_id,
                "error": str(e), "traceback": traceback.format_exc()})
     finally:
+        # Sandboxes are normally torn down inside the turn loop, but the
+        # close_sandboxes call is idempotent — call again defensively in
+        # case we exited mid-turn (exception during eval/step).
         try:
             env.close_sandboxes(problem_id)
         except Exception:

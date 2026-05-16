@@ -85,6 +85,16 @@ def main() -> None:
             os.environ["TORCH_CUDA_ARCH_LIST"] = tcl
         from kernelbench.eval import eval_kernel_against_ref, get_torch_dtype_from_string
         dtype = get_torch_dtype_from_string(precision)
+        # Cap each sandbox's GPU memory: with K=8 sandboxes per pair sharing
+        # the trainer GPU (~180 GB), if each grabs 20+ GB the pair OOMs.
+        # Force a tight ceiling so the trainer still has headroom for the
+        # GRPO step. Fraction is read from env; default 0.06 (≈11 GB on B200).
+        import torch
+        frac = float(os.environ.get("TTT_SANDBOX_MEM_FRACTION", "0.06"))
+        try:
+            torch.cuda.set_per_process_memory_fraction(frac)
+        except Exception:
+            pass
     except Exception as e:  # noqa: BLE001
         _emit({"status": "fatal", "error": str(e),
                "traceback": traceback.format_exc()})
@@ -153,6 +163,18 @@ def main() -> None:
                 "traceback": traceback.format_exc(),
             }
         _emit(payload)
+
+        # Drop refs to the eval result so the loaded .so module's GPU memory
+        # (CUDA fatbin, kernel symbol tables, tensors used in trials) can be
+        # GC'd. Without this, each load_inline() call leaks ~100-500 MB into
+        # the sandbox CUDA context — after a few dozen turns we OOM.
+        del res
+        try:
+            import gc, torch
+            gc.collect()
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
