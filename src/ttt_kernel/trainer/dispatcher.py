@@ -62,22 +62,32 @@ class Dispatcher:
         return fut
 
     def run_forever(self) -> None:
-        """Worker thread: loop until 'exit' is broadcast."""
+        """Worker thread: loop until 'exit' is broadcast.
+
+        Rank 0 MUST enter the broadcast every iteration even when its inbox
+        is empty — otherwise non-rank-0 ranks (which unconditionally call
+        broadcast_object_list) block on the collective and NCCL's 10-minute
+        watchdog kills them. When the inbox is empty rank 0 broadcasts a
+        'noop' command that other ranks recognize and skip.
+        """
         while not self._stop:
+            job: Optional[_Job] = None
             if self.rank == 0:
                 try:
                     job = self._inbox.get(timeout=0.1)
+                    obj = [job.cmd, job.payload]
                 except queue.Empty:
-                    continue
-                obj = [job.cmd, job.payload]
+                    obj = ["noop", {}]
             else:
                 obj = [None, None]
             if self.world > 1 and dist.is_initialized():
                 dist.broadcast_object_list(obj, src=0)
             cmd, payload = obj[0], obj[1]
+            if cmd == "noop":
+                continue
             if cmd == "exit":
                 self._stop = True
-                if self.rank == 0 and job.future is not None and not job.future.done():
+                if self.rank == 0 and job is not None and job.future is not None and not job.future.done():
                     self._loop.call_soon_threadsafe(job.future.set_result, {"ok": True})
                 break
             try:
@@ -85,17 +95,17 @@ class Dispatcher:
             except KeyError:
                 err = f"unknown cmd '{cmd}'"
                 log.error(err)
-                if self.rank == 0:
+                if self.rank == 0 and job is not None:
                     self._loop.call_soon_threadsafe(job.future.set_exception, RuntimeError(err))
                 continue
             try:
                 result = handler(payload or {})
             except BaseException as e:  # noqa: BLE001
                 log.exception("handler '%s' raised", cmd)
-                if self.rank == 0 and job.future is not None and not job.future.done():
+                if self.rank == 0 and job is not None and job.future is not None and not job.future.done():
                     self._loop.call_soon_threadsafe(job.future.set_exception, e)
                 continue
-            if self.rank == 0 and job.future is not None and not job.future.done():
+            if self.rank == 0 and job is not None and job.future is not None and not job.future.done():
                 self._loop.call_soon_threadsafe(job.future.set_result, result or {})
 
     def start(self) -> None:
