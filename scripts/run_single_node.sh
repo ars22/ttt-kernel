@@ -159,8 +159,10 @@ trap_handler() {
 }
 trap trap_handler INT TERM
 
-echo "[run] waiting 30s for services to start registering…"
-sleep 30
+# Orchestrator polls the registry + probes /healthz on each service, so we
+# only need a tiny head-start to let the registry directories be created.
+echo "[run] giving services 10s to advertise to the registry…"
+sleep 10
 
 echo "[run] starting orchestrator (foreground)"
 exec "$PY" -u -m ttt_kernel.orchestrator.main \

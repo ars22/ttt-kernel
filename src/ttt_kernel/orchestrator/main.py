@@ -52,6 +52,42 @@ async def _fetch_prompts_via_first_env(env_client: EnvClient, problem_ids: list[
     return out
 
 
+async def _wait_for_healthz(pools: list[tuple[str, "object"]], *, timeout_s: float) -> None:
+    """Poll /healthz on each pool member until all return True (or timeout).
+
+    The filesystem registry says "advertised" but services finish startup
+    work (sandbox spawn / model load / SGLang ready) inside the FastAPI
+    lifespan, which only completes once uvicorn starts serving. So after
+    seeing the registry file we still need to wait on /healthz.
+    """
+    import time
+    deadline = time.time() + timeout_s
+    pending = {(kind, m) for kind, pool in pools for m in pool.members}
+    last_log = 0.0
+    while pending:
+        now = time.time()
+        if now > deadline:
+            still = ", ".join(f"{k}/{m.entry.idx}@{m.entry.host}:{m.entry.port}" for k, m in pending)
+            raise TimeoutError(f"/healthz did not return OK within {timeout_s}s for: {still}")
+        done = set()
+        for kind, m in pending:
+            try:
+                ok = await m.client.healthz()
+            except Exception:  # noqa: BLE001
+                ok = False
+            if ok:
+                done.add((kind, m))
+                log.info("%s/%03d healthy at %s:%d",
+                         kind, m.entry.idx, m.entry.host, m.entry.port)
+        pending -= done
+        if pending and now - last_log > 30:
+            still = ", ".join(f"{k}/{m.entry.idx}" for k, m in pending)
+            log.info("still waiting on /healthz: %s", still)
+            last_log = now
+        if pending:
+            await asyncio.sleep(2.0)
+
+
 async def _drive(
     *,
     cfg: dict,
@@ -82,6 +118,18 @@ async def _drive(
     sampler_pool = build_pool(sampler_entries, lambda url: SamplerClient(url))
     env_pool = build_pool(env_entries, lambda url: EnvClient(url))
     trainer_pool = build_pool(trainer_entries, lambda url: TrainerClient(url))
+
+    # ---- wait for each registered service to actually serve /healthz ----
+    # Services write to the registry in main() BEFORE uvicorn lifespan starts
+    # (env spawns 12 sandbox subprocs; sampler waits on SGLang; trainer loads
+    # the base model). The registry says "up" the moment the entry is written;
+    # /healthz only returns true once the lifespan has finished startup.
+    log.info("probing /healthz on each pool member…")
+    await _wait_for_healthz([
+        ("sampler", sampler_pool),
+        ("env", env_pool),
+        ("trainer", trainer_pool),
+    ], timeout_s=1800.0)
 
     try:
         # ---- collect the problem id list from env --------------------------
