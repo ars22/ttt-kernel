@@ -62,24 +62,25 @@ async def _wait_for_healthz(pools: list[tuple[str, "object"]], *, timeout_s: flo
     """
     import time
     deadline = time.time() + timeout_s
-    pending = {(kind, m) for kind, pool in pools for m in pool.members}
+    pending: list[tuple[str, object]] = [(kind, m) for kind, pool in pools for m in pool.members]
     last_log = 0.0
     while pending:
         now = time.time()
         if now > deadline:
             still = ", ".join(f"{k}/{m.entry.idx}@{m.entry.host}:{m.entry.port}" for k, m in pending)
             raise TimeoutError(f"/healthz did not return OK within {timeout_s}s for: {still}")
-        done = set()
+        still_pending: list[tuple[str, object]] = []
         for kind, m in pending:
             try:
                 ok = await m.client.healthz()
             except Exception:  # noqa: BLE001
                 ok = False
             if ok:
-                done.add((kind, m))
                 log.info("%s/%03d healthy at %s:%d",
                          kind, m.entry.idx, m.entry.host, m.entry.port)
-        pending -= done
+            else:
+                still_pending.append((kind, m))
+        pending = still_pending
         if pending and now - last_log > 30:
             still = ", ".join(f"{k}/{m.entry.idx}" for k, m in pending)
             log.info("still waiting on /healthz: %s", still)
