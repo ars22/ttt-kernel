@@ -191,6 +191,14 @@ class AdapterManager:
         """
         import torch.distributed as dist
         os.makedirs(out_dir, exist_ok=True)
+        if self.world > 1:
+            # FSDP2 path: gather full tensors on rank 0 and write safetensors
+            # directly (PEFT's save_pretrained doesn't know about DTensors).
+            from .fsdp_save import save_adapter_fsdp
+            save_adapter_fsdp(self.peft_model, name, out_dir, self.peft_config, rank=self.rank)
+            if dist.is_initialized():
+                dist.barrier()
+            return out_dir
         if self.rank == 0:
             tmp = out_dir + ".tmp"
             if os.path.isdir(tmp):
