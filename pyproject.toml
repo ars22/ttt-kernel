@@ -35,7 +35,7 @@ serve = [
     # Install sglang separately per their instructions; pin here as a hint.
     "sglang[all]>=0.4.0",
 ]
-dev = ["pytest", "ruff"]
+dev = ["pytest", "pytest-asyncio>=0.23", "ruff"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
