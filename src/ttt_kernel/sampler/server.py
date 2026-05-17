@@ -146,6 +146,11 @@ def main() -> None:
     p.add_argument("--max-loaded-adapters", type=int, required=True,
                    help="LRU size for resident LoRA adapters in the SGLang server.")
     p.add_argument("--wait-ready-s", type=float, default=120.0)
+    p.add_argument("--run-root", default=None,
+                   help="If set, write a RegistryEntry to <run-root>/registry/sampler/<idx>.json on startup.")
+    p.add_argument("--idx", type=int, default=0)
+    p.add_argument("--advertise-host", default=None,
+                   help="Hostname to advertise in the registry (default: socket.gethostname()).")
     p.add_argument("--log-level", default="info")
     args = p.parse_args()
 
@@ -160,7 +165,22 @@ def main() -> None:
         max_loaded_adapters=args.max_loaded_adapters,
         wait_ready_s=args.wait_ready_s,
     )
-    uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)
+    if args.run_root:
+        import socket
+        from ..orchestrator.registry import write_entry, mark_down
+        from ..shared.types import RegistryEntry
+        host = args.advertise_host or socket.gethostname()
+        entry = RegistryEntry(
+            pool="sampler", idx=args.idx, host=host, port=args.port,
+            capacity=args.max_concurrent,
+        )
+        write_entry(args.run_root, entry)
+        try:
+            uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)
+        finally:
+            mark_down(args.run_root, "sampler", args.idx)
+    else:
+        uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)
 
 
 if __name__ == "__main__":

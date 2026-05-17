@@ -150,6 +150,12 @@ def main() -> None:
                         help="Total subprocess sandbox slots (capacity unit).")
     parser.add_argument("--sandbox-log", default=None,
                         help="Append all sandbox stderr to this file (else discarded).")
+    parser.add_argument("--run-root", default=None,
+                        help="If set, write a RegistryEntry to <run-root>/registry/env/<idx>.json on startup.")
+    parser.add_argument("--idx", type=int, default=0,
+                        help="SLURM array index (or 0 for single-node).")
+    parser.add_argument("--advertise-host", default=None,
+                        help="Hostname to advertise in the registry (default: socket.gethostname()).")
     parser.add_argument("--log-level", default="info")
     args = parser.parse_args()
 
@@ -158,7 +164,23 @@ def main() -> None:
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
     app = build_app(args.config, args.max_concurrent, args.sandbox_log)
-    uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)
+
+    if args.run_root:
+        import socket
+        from ..orchestrator.registry import write_entry, mark_down
+        from ..shared.types import RegistryEntry
+        host = args.advertise_host or socket.gethostname()
+        entry = RegistryEntry(
+            pool="env", idx=args.idx, host=host, port=args.port,
+            capacity=args.max_concurrent,
+        )
+        write_entry(args.run_root, entry)
+        try:
+            uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)
+        finally:
+            mark_down(args.run_root, "env", args.idx)
+    else:
+        uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)
 
 
 if __name__ == "__main__":
