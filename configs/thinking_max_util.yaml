@@ -1,0 +1,81 @@
+# Thinking-model, 16 turns/problem, tuned for one 8x B200 node (uses 6 GPUs).
+#
+# Layout used by scripts/run_single_node.sh:
+#   GPUs 0,1 → sampler (SGLang tp=2)
+#   GPUs 2,3 → trainer (FSDP=2)
+#   GPU  4   → env service 0 (12 sandbox slots)
+#   GPU  5   → env service 1 (12 sandbox slots)
+#
+# Sizing rationale: K=8 rollouts × max_tokens=32k means SGLang sees up to
+# 16 (per-problem in-flight) × 8 fan-out = 128 concurrent decode requests,
+# which 4B-Thinking handles comfortably under tp=2. Per-turn 8 problems
+# concurrent × K=8 = 64 eval jobs hitting 24 sandbox slots → env is the
+# pacing stage, exactly the right place for it (kernels are the slowest).
+
+model:
+  name: Qwen/Qwen3-4B-Thinking-2507
+  dtype: bfloat16
+  trust_remote_code: true
+
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.0
+  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+  bias: "none"
+
+rollout:
+  num_samples: 8
+  max_tokens: 32768
+  temperature: 1.0
+  top_p: 0.95
+
+kernelbench:
+  repo_path: /weka/scratch/schmidt/ssci-aviralku/asetlur/KernelBench
+  dataset_src: huggingface
+  dataset_name: ScalingIntelligence/KernelBench
+  level: 1
+  problem_ids: [1, 2, 3, 4, 5, 6, 7, 8]
+  backend: cuda
+  precision: fp32
+  gpu_arch: Blackwell
+  prompt_option: one_shot
+  num_correct_trials: 5
+  num_perf_trials: 50
+  timing_method: cuda_event
+  eval_timeout_s: 180
+
+reward:
+  speedup_log_scale: true
+  error_penalty: -1.0
+  incorrect_penalty: -1.0
+  clip: 2.0
+
+grpo:
+  beta_kl: 0.04
+  epsilon_clip: 0.2
+  group_advantage_norm: true
+  update_epochs: 1
+  learning_rate: 1.0e-5
+  weight_decay: 0.0
+  grad_clip: 1.0
+  # B=8, T=32k, vocab≈150k → per-chunk logits in bf16 ≈ 9.6 GB; mb=1 is safe under FSDP.
+  micro_batch_size: 1
+  max_seq_len: 32768
+
+loop:
+  num_turns: 16
+  seed: 0
+
+logging:
+  out_dir: ./runs
+  run_name: null
+  log_every: 1
+  save_adapter_every_turn: true
+  wandb:
+    enabled: false
+    project: ttt-kernel
+    entity: null
+    run_name: null
+    mode: online
+    tags: ["refactor", "thinking", "16turns"]
