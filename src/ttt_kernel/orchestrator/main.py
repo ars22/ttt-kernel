@@ -199,8 +199,16 @@ async def _drive(
             results = await asyncio.gather(*tasks, return_exceptions=True)
             for pid, res in zip(pids, results):
                 if isinstance(res, BaseException):
-                    log.exception("problem %d failed: %s", pid, res)
-                    logger.log("problem_failed", problem_id=pid, error=str(res))
+                    import traceback as _tb
+                    tb_str = "".join(_tb.format_exception(type(res), res, res.__traceback__))
+                    log.error("problem %d failed: %s: %r\n%s",
+                              pid, type(res).__name__, res, tb_str)
+                    logger.log("problem_failed",
+                               problem_id=pid,
+                               error_type=type(res).__name__,
+                               error_repr=repr(res),
+                               error_str=str(res),
+                               traceback=tb_str)
     finally:
         await sampler_pool.close()
         await env_pool.close()
