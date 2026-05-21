@@ -19,13 +19,20 @@ from ..shared.types import ErrorKind, EvaluateResponse
 @dataclass(frozen=True)
 class RewardCfg:
     speedup_log_scale: bool = True
-    error_penalty: float = -1.0
-    incorrect_penalty: float = -1.0
+    error_penalty: float = -3.0
+    incorrect_penalty: float = -3.0
     clip: float = 2.0
 
 
 def extract_kernel_src(raw_completion: str, extract_fn) -> Optional[str]:
-    if "</think>" in raw_completion:
+    # Strip the chain-of-thought prefix so the extractor only sees the model's
+    # final answer. Different model families use different markers:
+    #   - Qwen3-Thinking, R1-distill, etc.:  ...<think>...</think>FINAL ANSWER
+    #   - gpt-oss (harmony format):          <|channel|>analysis<|message|>...
+    #                                          <|channel|>final<|message|>FINAL ANSWER
+    if "<|channel|>final<|message|>" in raw_completion:
+        post = raw_completion.rsplit("<|channel|>final<|message|>", 1)[1]
+    elif "</think>" in raw_completion:
         post = raw_completion.rsplit("</think>", 1)[1]
     else:
         post = raw_completion

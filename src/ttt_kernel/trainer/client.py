@@ -3,7 +3,13 @@ from __future__ import annotations
 
 import httpx
 
-from ..shared.types import Capacity, TrainRequest, TrainResponse
+from ..shared.types import (
+    Capacity,
+    TrainBaseRequest,
+    TrainBaseResponse,
+    TrainRequest,
+    TrainResponse,
+)
 
 
 class TrainerClient:
@@ -36,3 +42,30 @@ class TrainerClient:
         r = await self._client.post("/train", json=req.model_dump())
         r.raise_for_status()
         return TrainResponse.model_validate(r.json())
+
+    async def init_broadcast(
+        self,
+        *,
+        sglang_base_url: str,
+        sglang_tp: int = 0,
+        master_address: str = "",
+        master_port: int = 0,
+        group_name: str = "ttt_weight_update",
+        weight_sync: str = "disk",
+        ckpt_root: str = "",
+    ) -> None:
+        r = await self._client.post("/init_broadcast", json={
+            "sglang_base_url": sglang_base_url,
+            "sglang_tp": sglang_tp,
+            "master_address": master_address,
+            "master_port": master_port,
+            "group_name": group_name,
+            "weight_sync": weight_sync,
+            "ckpt_root": ckpt_root,
+        }, timeout=600.0)
+        r.raise_for_status()
+
+    async def train_base(self, req: TrainBaseRequest) -> TrainBaseResponse:
+        r = await self._client.post("/train_base", json=req.model_dump())
+        r.raise_for_status()
+        return TrainBaseResponse.model_validate(r.json())

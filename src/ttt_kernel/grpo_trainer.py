@@ -6,10 +6,10 @@ hands us K rollouts (token strings + rewards). We:
   1. Tokenize prompt + completion, build per-token mask over the completion.
   2. Forward through the policy to get current-policy logprobs.
   3. Compute group-relative advantage:  A_i = (r_i - mean(r)) / (std(r) + eps)
-  4. Compute KL to a frozen reference snapshot (base model w/ no adapter).
-  5. PPO-clipped surrogate:  -E[ min(ratio * A, clip(ratio, 1±eps) * A) ] + beta * KL
-  6. AdamW step, grad clip.
-  7. Save adapter to disk so SGLang can hot-reload it.
+  4. REINFORCE surrogate:  -E[ logp * A ]  +  beta * KL(π || π_ref) when beta>0.
+     KL is sample-estimated against the base model with the adapter disabled.
+  5. AdamW step, grad clip.
+  6. Save adapter to disk so SGLang can hot-reload it.
 
 Distributed: when launched under torchrun (WORLD_SIZE > 1), we wrap the policy
 in DDP so multiple ranks share the gradient computation. Rollouts are sliced
@@ -326,32 +326,28 @@ class GRPOLoRATrainer:
                 out = self.model(input_ids=in_ids, attention_mask=am, use_cache=False)
                 tok_logp = _tok_logp(out.logits[:, :-1], tgt)
 
-                # ---- reference forward (adapter disabled, no grad) ---------
-                with torch.no_grad():
-                    with self._peft_model.disable_adapter():
-                        ref_out = self.model(input_ids=in_ids, attention_mask=am, use_cache=False)
-                    ref_tok_logp = _tok_logp(ref_out.logits[:, :-1], tgt)
-
-                # ---- PPO-clipped objective + KL ----------------------------
-                ratio = torch.exp(tok_logp - ref_tok_logp.detach())
-                eps = self.grpo_cfg.epsilon_clip
-                unclipped = ratio * adv_mb
-                clipped = torch.clamp(ratio, 1.0 - eps, 1.0 + eps) * adv_mb
-                pg_per_tok = -torch.min(unclipped, clipped)
-                kl_per_tok = tok_logp - ref_tok_logp
-
+                # REINFORCE objective.
+                pg_per_tok = -tok_logp * adv_mb
                 denom = tm.sum(dim=-1).clamp(min=1.0)
                 pg_per_seq = (pg_per_tok * tm).sum(dim=-1) / denom
-                kl_per_seq = (kl_per_tok * tm).sum(dim=-1) / denom
-                # Scale by chunk size so we get a true mean over the full batch
-                # after summing all chunks' contributions.
                 w = pg_per_seq.numel() / float(B)
                 pg_chunk = pg_per_seq.mean() * w
-                kl_chunk = kl_per_seq.mean() * w
-                loss_chunk = pg_chunk + self.grpo_cfg.beta_kl * kl_chunk
+
+                if self.grpo_cfg.beta_kl > 0.0:
+                    with torch.no_grad():
+                        with self._peft_model.disable_adapter():
+                            ref_out = self.model(input_ids=in_ids, attention_mask=am, use_cache=False)
+                        ref_tok_logp = _tok_logp(ref_out.logits[:, :-1], tgt)
+                    kl_per_tok = tok_logp - ref_tok_logp
+                    kl_per_seq = (kl_per_tok * tm).sum(dim=-1) / denom
+                    kl_chunk = kl_per_seq.mean() * w
+                    loss_chunk = pg_chunk + self.grpo_cfg.beta_kl * kl_chunk
+                    kl_acc = kl_acc + kl_chunk.detach()
+                else:
+                    loss_chunk = pg_chunk
+
                 loss_chunk.backward()
                 pg_acc = pg_acc + pg_chunk.detach()
-                kl_acc = kl_acc + kl_chunk.detach()
 
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 self._adapter_params(adapter_name),

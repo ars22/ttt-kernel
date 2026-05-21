@@ -1,13 +1,14 @@
-"""GRPO step — ported verbatim (math) from grpo_trainer.py::step.
+"""REINFORCE + KL-to-reference step with group-relative advantages.
 
 Pure function over (peft_model, optimizer, tokenizer, rollouts, cfg) so we
-can reuse it under both the single-GPU model wrap (task #5) and the FSDP2
-wrap (task #6) without copy-paste.
+can reuse it under both the single-GPU model wrap and the FSDP2 wrap
+without copy-paste.
 
-The maintained invariant vs main is: per-token logprob is `gather - logsumexp`,
-PPO ratio uses ref forward with adapter disabled, KL is the per-token
-difference, advantages are per-group mean/std-normalized. An algorithmic
-parity test against the `main` branch lives in tests/test_grpo_parity.py.
+Algorithm: per-token loss is `-logp(a|s) * advantage` (vanilla REINFORCE,
+no importance ratio, no clip). Advantages are mean/std-normalized inside
+each `group_id` group. When `beta_kl > 0` an extra `beta_kl * KL(π || π_ref)`
+penalty is added, estimated as `E[logp - logp_ref]` over sampled tokens;
+this requires one extra forward pass with `peft_model.disable_adapter()`.
 """
 from __future__ import annotations
 
@@ -18,11 +19,14 @@ import torch
 from peft import PeftModel
 from transformers import PreTrainedTokenizerBase
 
+# Type alias: the `peft_model` arg may be a real PeftModel (per-problem TTT
+# path) or None (multitask full-model path, where there are no adapters).
+PeftModelOrNone = Optional[PeftModel]
+
 
 @dataclass(frozen=True)
 class GRPOStepCfg:
     beta_kl: float
-    epsilon_clip: float
     group_advantage_norm: bool
     update_epochs: int
     grad_clip: float
@@ -120,11 +124,11 @@ def _group_advantages(
 
 def grpo_step(
     *,
-    peft_model: PeftModel,
+    peft_model: PeftModelOrNone,
     model_call: torch.nn.Module,         # what to call .forward() on (peft_model or DDP/FSDP wrap)
     optimizer: torch.optim.Optimizer,
     tokenizer: PreTrainedTokenizerBase,
-    adapter_name: str,
+    adapter_name: Optional[str],
     adapter_params: list[torch.nn.Parameter],
     rollouts: List[RolloutT],
     cfg: GRPOStepCfg,
@@ -134,7 +138,18 @@ def grpo_step(
     if group_ids is None:
         group_ids = [0] * len(rollouts)
     assert len(group_ids) == len(rollouts)
-    peft_model.set_adapter(adapter_name)
+    # Multitask / full-model path: no adapter routing, and no second forward
+    # under disable_adapter for the KL term (the base model IS the policy, so
+    # there's no cheap π_ref). Caller must set beta_kl=0 in that case.
+    if peft_model is None:
+        if cfg.beta_kl > 0.0:
+            raise ValueError(
+                "grpo_step: beta_kl>0 requires a PEFT model (so the base can "
+                "be used as π_ref via disable_adapter). For full-model training "
+                "set beta_kl=0 or wire a separate frozen reference model."
+            )
+    else:
+        peft_model.set_adapter(adapter_name)
 
     rewards = torch.tensor([r.reward for r in rollouts], dtype=torch.float32, device=device)
     adv = _group_advantages(rewards, group_ids, norm=cfg.group_advantage_norm, device=device)
@@ -166,27 +181,32 @@ def grpo_step(
 
             out = model_call(input_ids=in_ids, attention_mask=am, use_cache=False)
             tok_logp = _tok_logp(out.logits[:, :-1], tgt)
-            with torch.no_grad():
-                with peft_model.disable_adapter():
-                    ref_out = model_call(input_ids=in_ids, attention_mask=am, use_cache=False)
-                ref_tok_logp = _tok_logp(ref_out.logits[:, :-1], tgt)
 
-            ratio = torch.exp(tok_logp - ref_tok_logp.detach())
-            eps = cfg.epsilon_clip
-            unclipped = ratio * adv_mb
-            clipped = torch.clamp(ratio, 1.0 - eps, 1.0 + eps) * adv_mb
-            pg_per_tok = -torch.min(unclipped, clipped)
-            kl_per_tok = tok_logp - ref_tok_logp
+            # REINFORCE: -logp * advantage. No importance ratio, no clip.
+            pg_per_tok = -tok_logp * adv_mb
+
             denom = tm.sum(dim=-1).clamp(min=1.0)
             pg_per_seq = (pg_per_tok * tm).sum(dim=-1) / denom
-            kl_per_seq = (kl_per_tok * tm).sum(dim=-1) / denom
             w = pg_per_seq.numel() / float(B)
             pg_chunk = pg_per_seq.mean() * w
-            kl_chunk = kl_per_seq.mean() * w
-            loss_chunk = pg_chunk + cfg.beta_kl * kl_chunk
+
+            # KL(π || π_ref) anchor, sample-based k1 estimator. Only pay the
+            # extra ref forward when the term actually contributes.
+            if cfg.beta_kl > 0.0:
+                with torch.no_grad():
+                    with peft_model.disable_adapter():
+                        ref_out = model_call(input_ids=in_ids, attention_mask=am, use_cache=False)
+                    ref_tok_logp = _tok_logp(ref_out.logits[:, :-1], tgt)
+                kl_per_tok = tok_logp - ref_tok_logp
+                kl_per_seq = (kl_per_tok * tm).sum(dim=-1) / denom
+                kl_chunk = kl_per_seq.mean() * w
+                loss_chunk = pg_chunk + cfg.beta_kl * kl_chunk
+                kl_acc = kl_acc + kl_chunk.detach()
+            else:
+                loss_chunk = pg_chunk
+
             loss_chunk.backward()
             pg_acc = pg_acc + pg_chunk.detach()
-            kl_acc = kl_acc + kl_chunk.detach()
 
         grad_norm = torch.nn.utils.clip_grad_norm_(adapter_params, cfg.grad_clip)
         optimizer.step()

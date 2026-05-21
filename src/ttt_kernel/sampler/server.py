@@ -106,7 +106,11 @@ def build_app(
 
     @app.post("/sample", response_model=SampleResponse)
     async def sample(req: SampleRequest):
-        await lru.ensure_loaded(req.adapter_name, req.adapter_path)
+        # Empty adapter handle = base-model inference. Skip the load_lora_adapter
+        # call entirely and let SGLangWire fall back to self.model_name.
+        use_adapter = bool(req.adapter_name) and bool(req.adapter_path)
+        if use_adapter:
+            await lru.ensure_loaded(req.adapter_name, req.adapter_path)
         state["in_flight"] += 1
         try:
             results = await wire.sample(
@@ -115,7 +119,8 @@ def build_app(
                 temperature=req.temperature,
                 top_p=req.top_p,
                 max_tokens=req.max_tokens,
-                adapter_name=req.adapter_name,
+                adapter_name=req.adapter_name if use_adapter else None,
+                reasoning_effort=req.reasoning_effort,
             )
         finally:
             state["in_flight"] -= 1

@@ -72,8 +72,8 @@ def _build_sandbox_cfg(yaml_kb: dict) -> SandboxCfg:
 def _build_reward_cfg(yaml_rw: dict) -> RewardCfg:
     return RewardCfg(
         speedup_log_scale=bool(yaml_rw.get("speedup_log_scale", True)),
-        error_penalty=float(yaml_rw.get("error_penalty", -1.0)),
-        incorrect_penalty=float(yaml_rw.get("incorrect_penalty", -1.0)),
+        error_penalty=float(yaml_rw.get("error_penalty", -3.0)),
+        incorrect_penalty=float(yaml_rw.get("incorrect_penalty", -3.0)),
         clip=float(yaml_rw.get("clip", 2.0)),
     )
 

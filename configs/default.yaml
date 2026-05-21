@@ -50,14 +50,13 @@ reward:
   # Maps (compiled, correct, speedup) -> scalar reward.
   # speedup > 1: positive (favored); speedup < 1: negative; any error: negative.
   speedup_log_scale: true   # use log(speedup) so 2x and 0.5x are symmetric
-  error_penalty: -1.0
-  incorrect_penalty: -1.0
+  error_penalty: -3.0
+  incorrect_penalty: -3.0
   # Clip rewards to [-clip, clip] before normalization
   clip: 2.0
 
 grpo:
   beta_kl: 0.04                # KL coeff to reference (frozen base + frozen adapter snapshot)
-  epsilon_clip: 0.2            # PPO-style importance-sampling clip
   group_advantage_norm: true   # subtract group mean / divide by group std
   update_epochs: 1             # gradient passes per turn over the K rollouts
   learning_rate: 1.0e-5

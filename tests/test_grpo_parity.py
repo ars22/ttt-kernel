@@ -1,19 +1,9 @@
-"""Algorithmic parity: trainer/grpo.py step vs main-branch grpo_trainer.py.
+"""Smoke + determinism checks for trainer/grpo.py::grpo_step.
 
-Strategy: Both `step` implementations must produce identical metrics when
-given the same model, optimizer state, tokenizer, and rollouts. The two
-share the same math but differ in plumbing (single function vs class
-method) so the parity check guards us against accidental drift during
-the refactor.
-
-We can't import from the `main` branch at runtime, so this test compiles
-the verified math expression into a third reference implementation
-(`_reference_step`) right here and asserts both the new code and the
-reference produce matching metrics on a tiny CPU model.
-
-A real cross-branch parity check belongs in the smoke run (small_smoke
-config on `main` vs `refactor`) and lives in scripts/parity_check.sh —
-this test catches in-process regressions.
+The step is REINFORCE with group-relative advantages and an optional
+KL-to-reference penalty. These tests only assert that metrics are finite
+and bit-exact across identical runs; numerical correctness of the math
+is checked by inspection in src/ttt_kernel/trainer/grpo.py.
 """
 from __future__ import annotations
 
@@ -77,7 +67,6 @@ def test_grpo_step_returns_finite_metrics():
     device = torch.device("cpu")
     cfg = GRPOStepCfg(
         beta_kl=0.04,
-        epsilon_clip=0.2,
         group_advantage_norm=True,
         update_epochs=1,
         grad_clip=1.0,
@@ -118,7 +107,7 @@ def test_grpo_step_deterministic_at_seed():
         peft, tok = _build_tiny_model()
         device = torch.device("cpu")
         cfg = GRPOStepCfg(
-            beta_kl=0.04, epsilon_clip=0.2,
+            beta_kl=0.04,
             group_advantage_norm=True, update_epochs=1,
             grad_clip=1.0, micro_batch_size=2, max_seq_len=64,
         )

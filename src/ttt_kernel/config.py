@@ -63,14 +63,13 @@ class KernelBenchCfg(BaseModel):
 
 class RewardCfg(BaseModel):
     speedup_log_scale: bool = True
-    error_penalty: float = -1.0
-    incorrect_penalty: float = -1.0
+    error_penalty: float = -3.0
+    incorrect_penalty: float = -3.0
     clip: float = 2.0
 
 
 class GRPOCfg(BaseModel):
     beta_kl: float = 0.04
-    epsilon_clip: float = 0.2
     group_advantage_norm: bool = True
     update_epochs: int = 1
     learning_rate: float = 1.0e-5
@@ -117,6 +116,25 @@ class LoopCfg(BaseModel):
     seed: int = 0
 
 
+class MultitaskCfg(BaseModel):
+    """Multi-task RL baseline: train a single set of base-model weights jointly
+    on a rotating batch of KernelBench problems.
+
+    Per step: pick `problems_per_step` problems uniformly (with replacement
+    across steps; without within a step), sample `rollout.num_samples` rollouts
+    each, evaluate, REINFORCE-step on the flat N*K batch with `group_ids` =
+    per-problem index (so advantage normalization is per-problem). After each
+    step, the trainer broadcasts updated weights to the sampler's SGLang.
+    """
+    problems_per_step: int = 32
+    num_steps: int = 200
+    # 'nccl': torch.distributed broadcast from trainer rank 0 to SGLang TP ranks.
+    # 'disk': save_pretrained + sampler /update_weights_from_disk (simpler, slow).
+    weight_sync: str = "nccl"
+    # NCCL weight-update-group bootstrap. Trainer is master; SGLang ranks join.
+    weight_sync_master_port: int = 29600
+
+
 class WandbCfg(BaseModel):
     enabled: bool = False
     project: str = "ttt-kernel"
@@ -143,6 +161,7 @@ class Config(BaseModel):
     reward: RewardCfg = RewardCfg()
     grpo: GRPOCfg = GRPOCfg()
     loop: LoopCfg = LoopCfg()
+    multitask: MultitaskCfg = MultitaskCfg()
     logging: LoggingCfg = LoggingCfg()
     pool: PoolCfg = PoolCfg()
 

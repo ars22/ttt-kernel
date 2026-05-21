@@ -30,13 +30,21 @@ import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
+from typing import Optional
 
 import torch
 import uvicorn
 import yaml
 from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 
-from ..shared.types import Capacity, TrainRequest, TrainResponse
+from ..shared.types import (
+    Capacity,
+    TrainBaseRequest,
+    TrainBaseResponse,
+    TrainRequest,
+    TrainResponse,
+)
 from .adapter_manager import AdapterManager
 from .dispatcher import Dispatcher
 from .grpo import GRPOStepCfg, RolloutT, grpo_step
@@ -49,6 +57,23 @@ from .model import (
 )
 
 log = logging.getLogger("ttt_kernel.trainer.server")
+
+
+class _InitBroadcastReq(BaseModel):
+    """Body for /init_broadcast — kept at module level so FastAPI's type
+    introspection can resolve it (Pydantic v2 forward refs defined inside
+    a function body trip TypeAdapter('not fully defined')).
+    """
+    sglang_base_url: str
+    sglang_tp: int = 0                  # ignored when weight_sync='disk'
+    master_address: str = ""             # ignored when weight_sync='disk'
+    master_port: int = 0                  # ignored when weight_sync='disk'
+    group_name: str = "ttt_weight_update"
+    # 'nccl' (broken on this cluster; needs further debugging) or 'disk'.
+    weight_sync: str = "disk"
+    # For weight_sync='disk': where the trainer writes step_<N>/ HF dirs.
+    # Must be readable by SGLang too (i.e., a shared FS path).
+    ckpt_root: str = ""
 
 
 def _build_model_cfg(raw: dict) -> ModelInitCfg:
@@ -73,7 +98,6 @@ def _build_grpo_cfg(raw: dict) -> GRPOStepCfg:
     g = raw["grpo"]
     return GRPOStepCfg(
         beta_kl=float(g.get("beta_kl", 0.04)),
-        epsilon_clip=float(g.get("epsilon_clip", 0.2)),
         group_advantage_norm=bool(g.get("group_advantage_norm", True)),
         update_epochs=int(g.get("update_epochs", 1)),
         grad_clip=float(g.get("grad_clip", 1.0)),
@@ -185,11 +209,42 @@ def _save_sync(manager: AdapterManager, name: str, out_dir: str) -> None:
         dist.barrier()
 
 
+def _train_base_handler(model, tokenizer, optimizer, grpo_cfg, device):
+    """Collective handler for /train_base.
+
+    Runs on EVERY rank. Payload: rollouts (list of dicts) + group_ids.
+    Returns the metrics dict (rank 0 only). No adapter args — the base
+    model itself is the policy.
+    """
+    def handler(payload: dict) -> dict:
+        rollouts = [
+            RolloutT(prompt=r["prompt"], completion=r["completion"], reward=float(r["reward"]))
+            for r in payload["rollouts"]
+        ]
+        group_ids = payload.get("group_ids")
+        params = [p for p in model.parameters() if p.requires_grad]
+        metrics = grpo_step(
+            peft_model=None,
+            model_call=model,
+            optimizer=optimizer,
+            tokenizer=tokenizer,
+            adapter_name=None,
+            adapter_params=params,
+            rollouts=rollouts,
+            cfg=grpo_cfg,
+            device=device,
+            group_ids=group_ids,
+        )
+        return metrics
+    return handler
+
+
 def build_app(
     config_path: str,
     max_concurrent: int,
     max_resident_adapters: int,
     use_fsdp: bool = False,
+    full_model: bool = False,
 ) -> tuple[FastAPI, Dispatcher | None]:
     raw = yaml.safe_load(open(config_path))
     model_cfg = _build_model_cfg(raw)
@@ -200,34 +255,68 @@ def build_app(
 
     rank, world, local_rank = init_distributed()
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
-    log.info("trainer init: rank=%d world=%d device=%s fsdp=%s",
-             rank, world, device, use_fsdp)
+    log.info("trainer init: rank=%d world=%d device=%s fsdp=%s full_model=%s",
+             rank, world, device, use_fsdp, full_model)
 
-    if use_fsdp and world > 1:
+    # ---- model construction ------------------------------------------------
+    # Three modes:
+    #   A) full_model + world>1: FSDP-wrapped bare causal LM (multitask path).
+    #   B) PEFT + use_fsdp + world>1: per-problem LoRA path under FSDP.
+    #   C) PEFT, single GPU.
+    base_model = None      # full-model path
+    peft_model = None      # PEFT path
+    optimizer = None       # full-model path
+    manager: Optional[AdapterManager] = None  # PEFT path
+
+    tokenizer = build_tokenizer(model_cfg)
+
+    if full_model:
+        from .full_model import build_fsdp_full_model
+        if world == 1:
+            # Allow single-GPU full-model for smoke tests; build_fsdp_full_model
+            # still wraps but with a 1-rank mesh which is a no-op shard.
+            log.warning("full-model path with world=1: FSDP wrap is a no-op")
+        base_model = build_fsdp_full_model(model_cfg, rank, world, local_rank)
+        optimizer = torch.optim.AdamW(
+            [p for p in base_model.parameters() if p.requires_grad],
+            lr=learning_rate,
+            weight_decay=weight_decay,
+        )
+    elif use_fsdp and world > 1:
         from .fsdp_model import build_fsdp_peft_model
         peft_model = build_fsdp_peft_model(model_cfg, rank, world, local_rank)
     else:
         peft_model = build_peft_model(model_cfg, device)
-    tokenizer = build_tokenizer(model_cfg)
 
-    manager = AdapterManager(
-        peft_model=peft_model,
-        peft_config=build_peft_lora_cfg(model_cfg),
-        learning_rate=learning_rate,
-        weight_decay=weight_decay,
-        max_resident=max_resident_adapters,
-        device=device,
-        rank=rank,
-        world=world,
-    )
+    if not full_model:
+        assert peft_model is not None
+        manager = AdapterManager(
+            peft_model=peft_model,
+            peft_config=build_peft_lora_cfg(model_cfg),
+            learning_rate=learning_rate,
+            weight_decay=weight_decay,
+            max_resident=max_resident_adapters,
+            device=device,
+            rank=rank,
+            world=world,
+        )
 
+    # ---- dispatcher (collective broadcast for FSDP) ------------------------
     dispatcher: Dispatcher | None = None
     if world > 1:
-        train_handler = _train_step_handler(manager, tokenizer, grpo_cfg, device)
-        dispatcher = Dispatcher(rank, world, handlers={"train": train_handler})
+        handlers: dict[str, object] = {}
+        if full_model:
+            handlers["train_base"] = _train_base_handler(
+                base_model, tokenizer, optimizer, grpo_cfg, device,
+            )
+        else:
+            handlers["train"] = _train_step_handler(manager, tokenizer, grpo_cfg, device)
+        dispatcher = Dispatcher(rank, world, handlers=handlers)
 
     sem = asyncio.Semaphore(max_concurrent)
     state = {"in_flight": 0}
+    # Lazily created on first /init_broadcast call. Trainer only.
+    broadcaster_holder: dict = {"broadcaster": None}
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):  # noqa: ANN001
@@ -239,10 +328,15 @@ def build_app(
         finally:
             if dispatcher is not None:
                 dispatcher.stop_blocking()
+            b = broadcaster_holder.get("broadcaster")
+            if b is not None:
+                await b.aclose()
 
     app = FastAPI(title="ttt-kernel trainer pool", lifespan=lifespan)
-    app.state.manager = manager
+    if manager is not None:
+        app.state.manager = manager
     app.state.counters = state
+    app.state.full_model = full_model
 
     @app.get("/healthz")
     async def healthz():
@@ -258,6 +352,8 @@ def build_app(
 
     @app.post("/train", response_model=TrainResponse)
     async def train(req: TrainRequest):
+        if full_model:
+            raise HTTPException(400, "trainer is in --full-model mode; use /train_base")
         if not req.rollouts:
             raise HTTPException(400, "empty rollouts")
         await sem.acquire()
@@ -313,6 +409,146 @@ def build_app(
             state["in_flight"] -= 1
             sem.release()
 
+    # ---- full-model / multitask endpoints --------------------------------
+    if full_model:
+        from .weight_broadcast import BroadcastCfg, WeightBroadcaster
+        from .disk_sync import DiskBroadcaster, DiskSyncCfg
+
+        def _build_broadcaster(payload: dict):
+            mode = payload.get("weight_sync", "disk")
+            if mode == "disk":
+                return DiskBroadcaster(
+                    DiskSyncCfg(
+                        sglang_base_url=payload["sglang_base_url"],
+                        ckpt_root=payload["ckpt_root"],
+                    ),
+                    rank=rank, world=world,
+                )
+            elif mode == "nccl":
+                return WeightBroadcaster(
+                    BroadcastCfg(
+                        sglang_base_url=payload["sglang_base_url"],
+                        sglang_tp=int(payload["sglang_tp"]),
+                        master_address=payload["master_address"],
+                        master_port=int(payload["master_port"]),
+                        group_name=payload.get("group_name", "ttt_weight_update"),
+                    ),
+                    rank=rank, world=world,
+                )
+            else:
+                raise ValueError(f"unknown weight_sync mode: {mode!r}")
+
+        @app.post("/init_broadcast")
+        async def init_broadcast(req: _InitBroadcastReq):  # noqa: ANN001
+            if broadcaster_holder["broadcaster"] is not None:
+                return {"ok": True, "already_initialized": True}
+            payload = req.model_dump()
+            bc = _build_broadcaster(payload)
+            broadcaster_holder["broadcaster"] = bc
+
+            async def _do_init_collective():
+                if dispatcher is not None:
+                    fut = dispatcher.submit("init_broadcast", payload)
+                    await fut
+                else:
+                    await bc.init_group_async()
+            await _do_init_collective()
+            return {"ok": True, "weight_sync": req.weight_sync}
+
+        @app.post("/train_base", response_model=TrainBaseResponse)
+        async def train_base(req: TrainBaseRequest):
+            if not req.rollouts:
+                raise HTTPException(400, "empty rollouts")
+            await sem.acquire()
+            state["in_flight"] += 1
+            try:
+                if dispatcher is not None:
+                    fut = dispatcher.submit("train_base", {
+                        "step": req.step,
+                        "rollouts": [r.model_dump() for r in req.rollouts],
+                        "group_ids": req.group_ids,
+                    })
+                    metrics = await fut
+                else:
+                    metrics = await asyncio.to_thread(
+                        grpo_step,
+                        peft_model=None,
+                        model_call=base_model,
+                        optimizer=optimizer,
+                        tokenizer=tokenizer,
+                        adapter_name=None,
+                        adapter_params=[p for p in base_model.parameters() if p.requires_grad],
+                        rollouts=[
+                            RolloutT(prompt=r.prompt, completion=r.completion, reward=r.reward)
+                            for r in req.rollouts
+                        ],
+                        cfg=grpo_cfg,
+                        device=device,
+                        group_ids=req.group_ids,
+                    )
+
+                sync_ms = 0.0
+                bc = broadcaster_holder["broadcaster"]
+                if bc is not None:
+                    if dispatcher is not None:
+                        bfut = dispatcher.submit("broadcast_weights", {})
+                        sync_ms = float(await bfut)
+                    else:
+                        if isinstance(bc, DiskBroadcaster):
+                            sync_ms = await bc.broadcast_model(base_model)
+                        else:
+                            sync_ms = await bc.broadcast_named_params(
+                                base_model.named_parameters()
+                            )
+
+                return TrainBaseResponse(
+                    loss=metrics["loss"],
+                    pg=metrics["pg"],
+                    kl=metrics["kl"],
+                    grad_norm=metrics["grad_norm"],
+                    reward_mean=metrics["reward_mean"],
+                    reward_std=metrics["reward_std"],
+                    advantage_mean=metrics["advantage_mean"],
+                    weight_sync_ms=sync_ms,
+                )
+            finally:
+                state["in_flight"] -= 1
+                sem.release()
+
+        # Register the two collective handlers (init + broadcast) so non-rank-0
+        # ranks join the work. These are no-ops on world=1.
+        if dispatcher is not None:
+            def _init_broadcast_handler(payload: dict) -> dict:
+                bc = broadcaster_holder.get("broadcaster")
+                if bc is None:
+                    bc = _build_broadcaster(payload)
+                    broadcaster_holder["broadcaster"] = bc
+                loop = asyncio.new_event_loop()
+                try:
+                    loop.run_until_complete(bc.init_group_async())
+                finally:
+                    loop.close()
+                return {"ok": True}
+
+            def _broadcast_weights_handler(payload: dict) -> dict:
+                bc = broadcaster_holder.get("broadcaster")
+                if bc is None:
+                    raise RuntimeError("broadcaster not initialized")
+                loop = asyncio.new_event_loop()
+                try:
+                    if isinstance(bc, DiskBroadcaster):
+                        ms = loop.run_until_complete(bc.broadcast_model(base_model))
+                    else:
+                        ms = loop.run_until_complete(
+                            bc.broadcast_named_params(base_model.named_parameters())
+                        )
+                finally:
+                    loop.close()
+                return {"weight_sync_ms": float(ms)}
+
+            dispatcher.handlers["init_broadcast"] = _init_broadcast_handler
+            dispatcher.handlers["broadcast_weights"] = _broadcast_weights_handler
+
     return app, dispatcher
 
 
@@ -334,6 +570,9 @@ def main() -> None:
     p.add_argument("--fsdp", action="store_true",
                    help="Wrap base model in FSDP2 fully_shard (per transformer block). "
                         "Only meaningful under torchrun (WORLD_SIZE>1).")
+    p.add_argument("--full-model", action="store_true",
+                   help="Train the base model directly (no PEFT/LoRA). Implies "
+                        "--fsdp under torchrun. Exposes /train_base + /init_broadcast.")
     p.add_argument("--run-root", default=None,
                    help="If set, write a RegistryEntry to <run-root>/registry/trainer/<idx>.json on startup.")
     p.add_argument("--idx", type=int, default=0)
@@ -348,6 +587,7 @@ def main() -> None:
     app, dispatcher = build_app(
         args.config, args.max_concurrent, args.max_resident_adapters,
         use_fsdp=args.fsdp,
+        full_model=args.full_model,
     )
     rank = int(os.environ.get("RANK", "0"))
     if rank != 0:

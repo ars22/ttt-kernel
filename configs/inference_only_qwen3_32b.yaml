@@ -1,42 +1,44 @@
-# Smallest end-to-end smoke test of the three-pool architecture.
-#
-# Used by run_refactor.sh as the default for the multi-node smoke test:
-# 1 sampler + 1 trainer + 2 env workers, 2 problems × 2 turns.
-# Pass criteria: events.jsonl has problem_done rows for both, each problem
-# has adapter dirs at v000, v001, v002 on disk.
-
 model:
-  name: Qwen/Qwen3-4B-Instruct-2507
+  name: Qwen/Qwen3-32B
   dtype: bfloat16
   trust_remote_code: true
 
 lora:
   r: 16
   alpha: 32
-  dropout: 0.0
+  dropout: 0.05
   target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
   bias: "none"
 
+sglang:
+  base_url: http://127.0.0.1:30100
+  adapter_name: ttt
+  adapter_out_dir: ./adapters/ttt
+  update_weights_endpoint: /update_weights_from_disk
+
 rollout:
-  num_samples: 2
-  max_tokens: 4096
+  num_samples: 8
+  # Qwen3 native context is 32k. Leave ~4k headroom for prompt + thinking.
+  max_tokens: 28000
   temperature: 1.0
   top_p: 0.95
+  # No reasoning_effort here: Qwen3 controls thinking via /think /no_think
+  # tokens at the chat-template level, not via a sampling-time knob.
 
 kernelbench:
-  repo_path: /weka/scratch/schmidt/ssci-aviralku/asetlur/KernelBench
+  repo_path: /project/flame/asetlur/KernelBench
   dataset_src: huggingface
   dataset_name: ScalingIntelligence/KernelBench
   level: 1
-  problem_ids: [1, 2]
+  problem_ids: null            # all 100 L1 problems
   backend: cuda
   precision: fp32
-  gpu_arch: Blackwell
+  gpu_arch: Hopper             # H100 cluster
   prompt_option: one_shot
-  num_correct_trials: 3
+  num_correct_trials: 5
   num_perf_trials: 20
   timing_method: cuda_event
-  eval_timeout_s: 60
+  eval_timeout_s: 120
 
 reward:
   speedup_log_scale: true
@@ -52,21 +54,23 @@ grpo:
   weight_decay: 0.0
   grad_clip: 1.0
   micro_batch_size: 1
-  max_seq_len: 4096
+  max_seq_len: 16384
 
 loop:
-  num_turns: 2
+  num_turns: 1
+  persist_adapter_across_problems: false
+  problem_batch_size: 1
   seed: 0
 
 logging:
   out_dir: ./runs
   run_name: null
   log_every: 1
-  save_adapter_every_turn: true
+  save_adapter_every_turn: false
   wandb:
-    enabled: false
+    enabled: true
     project: ttt-kernel
     entity: null
     run_name: null
     mode: online
-    tags: []
+    tags: ["inference-only", "qwen3-32b", "L1-full", "K8"]

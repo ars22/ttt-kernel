@@ -26,6 +26,9 @@ class SampleRequest(BaseModel):
     temperature: float = 1.0
     top_p: float = 0.95
     max_tokens: int = 16384
+    # gpt-oss harmony reasoning effort: "low" | "medium" | "high" | None.
+    # None lets the server use its default (typically "medium").
+    reasoning_effort: Optional[str] = None
 
 
 class Generation(BaseModel):
@@ -102,6 +105,29 @@ class TrainResponse(BaseModel):
     reward_mean: float
     reward_std: float
     advantage_mean: float
+
+
+class TrainBaseRequest(BaseModel):
+    """Orchestrator → trainer (multitask / full-model mode).
+
+    No adapter handles: the trainer trains the base model in place. After the
+    step the trainer broadcasts the updated weights to the sampler's SGLang
+    server (via NCCL when configured) before returning.
+    """
+    step: int
+    rollouts: List[Rollout]
+    group_ids: Optional[List[int]] = None
+
+
+class TrainBaseResponse(BaseModel):
+    loss: float
+    pg: float
+    kl: float
+    grad_norm: float
+    reward_mean: float
+    reward_std: float
+    advantage_mean: float
+    weight_sync_ms: float = 0.0
 
 
 # ---- capacity & registry --------------------------------------------------

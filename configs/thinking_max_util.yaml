@@ -47,13 +47,12 @@ kernelbench:
 
 reward:
   speedup_log_scale: true
-  error_penalty: -1.0
-  incorrect_penalty: -1.0
+  error_penalty: -3.0
+  incorrect_penalty: -3.0
   clip: 2.0
 
 grpo:
   beta_kl: 0.04
-  epsilon_clip: 0.2
   group_advantage_norm: true
   update_epochs: 1
   learning_rate: 1.0e-5

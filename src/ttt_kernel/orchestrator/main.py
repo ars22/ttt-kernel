@@ -98,12 +98,14 @@ async def _drive(
     num_trainers: int,
     problem_ids_override: List[int] | None,
     seed_skip: bool,
+    inference_only: bool = False,
 ) -> None:
     # ---- wait for the three pools to register --------------------------
     log.info("waiting for pools to register at %s/registry", run_root)
     sampler_entries = await asyncio.to_thread(wait_for_pool, run_root, "sampler", num_samplers)
     env_entries = await asyncio.to_thread(wait_for_pool, run_root, "env", num_envs)
-    trainer_entries = await asyncio.to_thread(wait_for_pool, run_root, "trainer", num_trainers)
+    if not inference_only:
+        trainer_entries = await asyncio.to_thread(wait_for_pool, run_root, "trainer", num_trainers)
 
     # ---- choose problem set (read from first env service) --------------
     sample_kwargs = {
@@ -111,6 +113,9 @@ async def _drive(
         "top_p": float(cfg["rollout"].get("top_p", 0.95)),
         "max_tokens": int(cfg["rollout"].get("max_tokens", 16384)),
     }
+    re_val = cfg["rollout"].get("reasoning_effort")
+    if re_val is not None:
+        sample_kwargs["reasoning_effort"] = str(re_val)
     K = int(cfg["rollout"].get("num_samples", 8))
     num_turns = int(cfg["loop"].get("num_turns", 5))
     adapters_root = str(run_root / "adapters")
@@ -118,7 +123,10 @@ async def _drive(
     # ---- build pools ----------------------------------------------------
     sampler_pool = build_pool(sampler_entries, lambda url: SamplerClient(url))
     env_pool = build_pool(env_entries, lambda url: EnvClient(url))
-    trainer_pool = build_pool(trainer_entries, lambda url: TrainerClient(url))
+    trainer_pool = (
+        None if inference_only
+        else build_pool(trainer_entries, lambda url: TrainerClient(url))  # type: ignore[possibly-undefined]
+    )
 
     # ---- wait for each registered service to actually serve /healthz ----
     # Services write to the registry in main() BEFORE uvicorn lifespan starts
@@ -126,11 +134,10 @@ async def _drive(
     # the base model). The registry says "up" the moment the entry is written;
     # /healthz only returns true once the lifespan has finished startup.
     log.info("probing /healthz on each pool member…")
-    await _wait_for_healthz([
-        ("sampler", sampler_pool),
-        ("env", env_pool),
-        ("trainer", trainer_pool),
-    ], timeout_s=1800.0)
+    healthz_pools = [("sampler", sampler_pool), ("env", env_pool)]
+    if not inference_only:
+        healthz_pools.append(("trainer", trainer_pool))
+    await _wait_for_healthz(healthz_pools, timeout_s=1800.0)
 
     try:
         # ---- collect the problem id list from env --------------------------
@@ -143,7 +150,9 @@ async def _drive(
             prompts_by_pid = await _fetch_prompts_via_first_env(e0, pids)
 
         # ---- seed v000 for each problem ------------------------------------
-        if not seed_skip:
+        if inference_only:
+            log.info("inference-only: skipping v000 adapter materialization")
+        elif not seed_skip:
             model_cfg = cfg["model"]
             lora_cfg = cfg.get("lora", {})
             await asyncio.to_thread(
@@ -176,27 +185,53 @@ async def _drive(
         with JsonlLogger(
             out_dir, run_name=cfg.get("logging", {}).get("run_name"),
             wandb_cfg=wandb_cfg, full_config=cfg,
+            inference_only=inference_only,
         ) as logger:
             async def _fetch_prompt(pid: int) -> str:
                 return prompts_by_pid[pid]
 
-            # ---- fan problems out ------------------------------------------
-            tasks = [
-                run_problem(
-                    problem_id=pid,
-                    num_turns=num_turns,
-                    K=K,
-                    sampler_pool=sampler_pool,
-                    env_pool=env_pool,
-                    trainer_pool=trainer_pool,
-                    adapters_root=adapters_root,
-                    base_prompt_fetcher=_fetch_prompt,
-                    logger=logger,
-                    sample_kwargs=sample_kwargs,
-                )
-                for pid in pids
-            ]
+            # ---- fan problems out with a progress bar ---------------------
+            # tqdm-on-asyncio: wrap each run_problem so it ticks the bar on
+            # completion. Postfix shows running pass@K and mean reward across
+            # finished problems so progress is informative for long runs.
+            from tqdm import tqdm
+            _stats = {"n": 0, "n_correct": 0, "n_compiled": 0, "sum_reward": 0.0}
+            pbar = tqdm(total=len(pids), desc="L1 problems", dynamic_ncols=True,
+                        smoothing=0.05, mininterval=0.5)
+
+            async def _run_with_progress(pid: int):
+                try:
+                    res = await run_problem(
+                        problem_id=pid,
+                        num_turns=num_turns,
+                        K=K,
+                        sampler_pool=sampler_pool,
+                        env_pool=env_pool,
+                        trainer_pool=trainer_pool,
+                        adapters_root=adapters_root,
+                        base_prompt_fetcher=_fetch_prompt,
+                        logger=logger,
+                        sample_kwargs=sample_kwargs,
+                        inference_only=inference_only,
+                        rollout_dump_dir=str(run_root / "rollouts"),
+                    )
+                    tm = (res.get("turn_metrics") or [{}])[-1] if isinstance(res, dict) else {}
+                    _stats["n"] += 1
+                    _stats["sum_reward"] += float(tm.get("reward_mean", 0.0))
+                    _stats["n_correct"] += int(tm.get("n_correct", 0) > 0)
+                    _stats["n_compiled"] += int(tm.get("n_compiled", 0) > 0)
+                    pbar.set_postfix({
+                        "pass@K": f"{_stats['n_correct']}/{_stats['n']}",
+                        "compile": f"{_stats['n_compiled']}/{_stats['n']}",
+                        "mean_R": f"{_stats['sum_reward']/max(_stats['n'],1):+.2f}",
+                    })
+                    return res
+                finally:
+                    pbar.update(1)
+
+            tasks = [_run_with_progress(pid) for pid in pids]
             results = await asyncio.gather(*tasks, return_exceptions=True)
+            pbar.close()
             for pid, res in zip(pids, results):
                 if isinstance(res, BaseException):
                     import traceback as _tb
@@ -212,7 +247,8 @@ async def _drive(
     finally:
         await sampler_pool.close()
         await env_pool.close()
-        await trainer_pool.close()
+        if trainer_pool is not None:
+            await trainer_pool.close()
 
 
 def main() -> None:
@@ -228,6 +264,8 @@ def main() -> None:
                         "(else read from the env service /problems).")
     p.add_argument("--seed-skip", action="store_true",
                    help="Skip v000 materialization (require pre-existing seeds).")
+    p.add_argument("--inference-only", action="store_true",
+                   help="Sample and evaluate only; skip training and trainer pool.")
     p.add_argument("--log-level", default="info")
     args = p.parse_args()
 
@@ -251,6 +289,7 @@ def main() -> None:
         num_trainers=args.num_trainers,
         problem_ids_override=pids_override,
         seed_skip=args.seed_skip,
+        inference_only=args.inference_only,
     ))
 
 

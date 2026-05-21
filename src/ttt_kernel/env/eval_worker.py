@@ -30,6 +30,16 @@ os.dup2(2, 1)
 _JSON_OUT = os.fdopen(_JSON_FD, "w", buffering=1)
 sys.stdout = sys.stderr
 
+# Give each sandbox subprocess its own torch_extensions build dir on node-local
+# /tmp. Without this, all sandboxes across all envs share the same NFS dir at
+# /project/flame/.cache/torch_extensions/<name>. PyTorch's load_inline takes a
+# FileLock on that dir, so when N sandboxes all build the same kernel name
+# (e.g. the model emits name="matmul_custom_ext" for every L1 matmul problem),
+# they serialize on a cross-node NFS lock and hang for minutes.
+_TORCH_EXT_DIR = f"/tmp/torch_ext_{os.getpid()}"
+os.makedirs(_TORCH_EXT_DIR, exist_ok=True)
+os.environ["TORCH_EXTENSIONS_DIR"] = _TORCH_EXT_DIR
+
 
 def _emit(obj: dict) -> None:
     _JSON_OUT.write(json.dumps(obj, default=str) + "\n")
@@ -72,6 +82,35 @@ def main() -> None:
         sys.path.insert(0, src)
     if repo_path not in sys.path:
         sys.path.insert(0, repo_path)
+
+    # Models in pre-training saw a lot of old CUDA examples and routinely emit
+    # `extra_cflags=["-std=c++14", ...]` in their load_inline call. Since the
+    # later -std= flag wins on the c++ command line, this downgrades PyTorch's
+    # default -std=c++17 to c++14 and modern torch headers (which use C++17-only
+    # `std::is_enum_v` etc.) fail to compile. Strip any `-std=c++14`/`-std=c++11`
+    # from extra_cflags/extra_cuda_cflags so PyTorch's -std=c++17 wins.
+    try:
+        from torch.utils import cpp_extension as _cpp_ext  # noqa: WPS433
+        _orig_load_inline = _cpp_ext.load_inline
+        _STD_BANLIST = ("-std=c++14", "-std=c++11", "-std=gnu++14", "-std=gnu++11")
+        def _filter_std(flags):
+            if not flags:
+                return flags
+            return [f for f in flags if f.strip() not in _STD_BANLIST]
+        def _patched_load_inline(*args, **kwargs):
+            kwargs["extra_cflags"] = _filter_std(kwargs.get("extra_cflags"))
+            kwargs["extra_cuda_cflags"] = _filter_std(kwargs.get("extra_cuda_cflags"))
+            return _orig_load_inline(*args, **kwargs)
+        _cpp_ext.load_inline = _patched_load_inline
+        # Also patch load() in case the kernel uses the non-inline variant.
+        _orig_load = _cpp_ext.load
+        def _patched_load(*args, **kwargs):
+            kwargs["extra_cflags"] = _filter_std(kwargs.get("extra_cflags"))
+            kwargs["extra_cuda_cflags"] = _filter_std(kwargs.get("extra_cuda_cflags"))
+            return _orig_load(*args, **kwargs)
+        _cpp_ext.load = _patched_load
+    except Exception:  # noqa: BLE001
+        pass
 
     try:
         from kernelbench.utils import set_gpu_arch, NVIDIA_ARCHS
@@ -148,13 +187,38 @@ def main() -> None:
             continue
 
         try:
+            # KernelBench's KernelExecResult historically had .summarize_for_feedback(),
+            # but the current version of the package only exposes the underlying fields
+            # (compiled, correctness, metadata, runtime, ref_runtime). Build the
+            # feedback string inline so this code works against both APIs.
+            if hasattr(res, "summarize_for_feedback"):
+                feedback_str = res.summarize_for_feedback()
+            else:
+                md = getattr(res, "metadata", {}) or {}
+                parts = [f"compiled={bool(res.compiled)}",
+                         f"correct={bool(res.correctness)}"]
+                if not res.compiled:
+                    err = md.get("compilation_error") or md.get("compile_error") or md.get("error")
+                    if err:
+                        parts.append(f"compile_error: {str(err)[:2000]}")
+                elif not res.correctness:
+                    err = md.get("correctness_issue") or md.get("max_difference") or md.get("error")
+                    if err:
+                        parts.append(f"incorrect: {str(err)[:2000]}")
+                else:
+                    parts.append(f"runtime_us={float(res.runtime):.2f} ref_runtime_us={float(res.ref_runtime):.2f}")
+                if md:
+                    extra = {k: v for k, v in md.items() if k not in {"compilation_error","compile_error","correctness_issue","max_difference","error"}}
+                    if extra:
+                        parts.append(f"metadata={extra}")
+                feedback_str = " | ".join(parts)
             payload = {
                 "status": "ok",
                 "compiled": bool(res.compiled),
                 "correctness": bool(res.correctness),
                 "runtime": float(res.runtime),
                 "ref_runtime": float(res.ref_runtime),
-                "feedback": res.summarize_for_feedback(),
+                "feedback": feedback_str,
             }
         except Exception as e:  # noqa: BLE001
             payload = {
