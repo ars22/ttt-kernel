@@ -18,3 +18,8 @@ wandb/
 *.egg-info/
 build/
 dist/
+
+# verl-mtl
+verl_mtl/data/
+runs_verl_mtl_*.out
+outputs/
