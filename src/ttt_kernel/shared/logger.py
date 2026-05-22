@@ -19,6 +19,7 @@ class JsonlLogger:
         run_name: Optional[str],
         wandb_cfg=None,
         full_config: Optional[dict] = None,
+        inference_only: bool = False,
     ):
         run_name = run_name or f"ttt_{int(time.time())}"
         self.run_name = run_name
@@ -29,9 +30,25 @@ class JsonlLogger:
 
         self._wandb = None
         self._step = 0
+        self._inference_only = inference_only
         # Track which problem ids we've already declared per-problem
         # step-metrics for in wandb, so per-problem panels use `turn` as x-axis.
         self._problem_metrics_defined: set[int] = set()
+        # Running aggregates for inference-only mode (no per-problem panels).
+        # Each `turn` event adds to these and we re-emit the agg/* scalars.
+        self._agg = {
+            "n_problems": 0,
+            "n_failed": 0,
+            "sum_reward_mean": 0.0,
+            "sum_reward_max": 0.0,
+            "sum_n_correct": 0,
+            "sum_n_compiled": 0,
+            "sum_samples": 0,            # total completions evaluated
+            "n_pass_at_k": 0,            # problems with any-correct
+            "n_compiled_any": 0,         # problems with any-compile
+            "sum_completion_tokens": 0,
+            "n_sample_events": 0,
+        }
         if wandb_cfg is not None and getattr(wandb_cfg, "enabled", False):
             import wandb  # imported lazily so the dep is optional
 
@@ -45,6 +62,10 @@ class JsonlLogger:
                 dir=str(self.run_dir),
                 resume="allow",
             )
+            if self._inference_only:
+                # One step-axis for all aggregate panels: problems completed.
+                self._wandb.define_metric("agg/n_problems")
+                self._wandb.define_metric("agg/*", step_metric="agg/n_problems")
 
     # --- per-problem metric scoping ----------------------------------------
     def _ensure_problem_metrics(self, problem_id: int) -> None:
@@ -68,9 +89,13 @@ class JsonlLogger:
         if self._wandb is None:
             return
 
-        # Per-turn events get logged under a per-problem namespace so each
-        # problem gets its own set of turn-indexed plots in wandb.
+        # Per-turn events: in training, log under a per-problem namespace so each
+        # problem gets its own turn-indexed panel. In inference-only, skip those
+        # 100-channel panels and update running aggregates instead.
         if event == "turn" and "problem_id" in fields and "turn" in fields:
+            if self._inference_only:
+                self._update_agg_from_turn(fields)
+                return
             pid = int(fields["problem_id"])
             turn = int(fields["turn"])
             self._ensure_problem_metrics(pid)
@@ -85,6 +110,25 @@ class JsonlLogger:
             self._wandb.log(payload)
             return
 
+        if self._inference_only and event == "problem_failed":
+            self._agg["n_failed"] += 1
+            self._wandb.log({"agg/n_failed": self._agg["n_failed"]})
+            return
+
+        if self._inference_only and event == "sample_done":
+            ct = fields.get("completion_tokens")
+            if isinstance(ct, (int, float)):
+                self._agg["sum_completion_tokens"] += int(ct)
+                self._agg["n_sample_events"] += 1
+            # Don't emit per-event scalars — covered by the running aggregate.
+            return
+
+        if self._inference_only and event in {"problem_start", "sample_start",
+                                              "problem_done", "evaluate_done"}:
+            # These are bookkeeping events; skip wandb to avoid noise. The
+            # JSONL still has the ground truth on disk.
+            return
+
         scalars = {
             f"{event}/{k}": v
             for k, v in fields.items()
@@ -95,6 +139,40 @@ class JsonlLogger:
             # with per-problem logs (which omit step to honor their declared
             # step_metric) risks monotonicity violations and silent drops.
             self._wandb.log(scalars)
+
+    def _update_agg_from_turn(self, fields: dict) -> None:
+        """Update running aggregates from a `turn` event and emit agg/* scalars."""
+        a = self._agg
+        a["n_problems"] += 1
+        rm = float(fields.get("reward_mean", 0.0))
+        rmax = float(fields.get("reward_max", 0.0))
+        nc = int(fields.get("n_correct", 0))
+        ncomp = int(fields.get("n_compiled", 0))
+        # Total samples per problem isn't in the event; infer it from the K
+        # config or default to len(rewards) if present. We assume `K=4` matches
+        # n_compiled+wrongs; fall back to 1 to avoid divide-by-zero.
+        a["sum_reward_mean"] += rm
+        a["sum_reward_max"] += rmax
+        a["sum_n_correct"] += nc
+        a["sum_n_compiled"] += ncomp
+        if nc > 0:
+            a["n_pass_at_k"] += 1
+        if ncomp > 0:
+            a["n_compiled_any"] += 1
+        n = max(a["n_problems"], 1)
+        avg_tok = (a["sum_completion_tokens"] / a["n_sample_events"]
+                   if a["n_sample_events"] else 0)
+        self._wandb.log({
+            "agg/n_problems":       a["n_problems"],
+            "agg/n_failed":         a["n_failed"],
+            "agg/reward_mean":      a["sum_reward_mean"] / n,
+            "agg/reward_max_mean":  a["sum_reward_max"]  / n,
+            "agg/pass_at_k_rate":   a["n_pass_at_k"]     / n,
+            "agg/compile_any_rate": a["n_compiled_any"]  / n,
+            "agg/sum_n_correct":    a["sum_n_correct"],
+            "agg/sum_n_compiled":   a["sum_n_compiled"],
+            "agg/mean_completion_tokens": avg_tok,
+        })
 
     def close(self) -> None:
         if not self._fp.closed:

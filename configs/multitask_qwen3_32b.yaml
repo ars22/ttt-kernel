@@ -1,0 +1,107 @@
+# Multi-task RL baseline: train a single set of Qwen3-32B weights jointly on
+# all 100 KernelBench L1 problems via REINFORCE. No LoRA, no per-problem state.
+#
+# Layout:
+#   Node 0: SGLang tp=4 (GPUs 0-3) + 4 env services (GPUs 4-7)
+#   Node 1: 1 trainer, torchrun --nproc-per-node=8, FSDP2 full-shard
+#
+# Per step: 32 problems × 8 rollouts = 256 sequences. grad_accum is implicit
+# in micro_batch_size=1 across 8 FSDP ranks (256 / 8 = 32 accumulation steps
+# per rank, accumulated by stepping through the rollout list).
+#
+# beta_kl=0 because the base model IS the policy — there's no cheap π_ref
+# unless we fit a frozen 32B copy alongside, which doesn't fit on 8×80GB.
+
+model:
+  name: Qwen/Qwen3-32B
+  dtype: bfloat16
+  trust_remote_code: true
+
+# LoRA block kept (default values) so the typed Config still loads, but it
+# is unused — the trainer ignores it under --full-model.
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+  bias: "none"
+
+sglang:
+  base_url: http://127.0.0.1:30100
+  adapter_name: unused
+  adapter_out_dir: ./adapters/unused
+  update_weights_endpoint: /update_weights_from_distributed
+  # SGLang tensor-parallel size (must match _node0 launch flag). Used by the
+  # trainer to size the NCCL update group.
+  tp_size: 4
+
+rollout:
+  num_samples: 8                # K rollouts per problem per step
+  max_tokens: 16000             # tight enough to fit 8x256 in trainer memory
+  temperature: 1.0
+  top_p: 0.95
+
+kernelbench:
+  repo_path: /project/flame/asetlur/KernelBench
+  dataset_src: huggingface
+  dataset_name: ScalingIntelligence/KernelBench
+  level: 1
+  problem_ids: null              # all 100 L1 problems (no holdout)
+  backend: cuda
+  precision: fp32
+  gpu_arch: Hopper
+  prompt_option: one_shot
+  num_correct_trials: 5
+  num_perf_trials: 20
+  timing_method: cuda_event
+  eval_timeout_s: 120
+
+reward:
+  speedup_log_scale: true
+  error_penalty: -3.0
+  incorrect_penalty: -3.0
+  clip: 2.0
+
+grpo:
+  beta_kl: 0.0                   # MUST be 0 in full-model mode (see grpo.py)
+  group_advantage_norm: true
+  update_epochs: 1
+  learning_rate: 1.0e-6          # full-model SGD is much smaller than LoRA
+  weight_decay: 0.0
+  grad_clip: 1.0
+  micro_batch_size: 1
+  # 16384 OOMs the backward on 8×H100 (activation checkpoint inputs alone are
+  # ~10GB per sequence at H=5120 × 64 layers × bf16). 8192 fits with headroom.
+  # Trainer truncates from the START of the completion (keeps the END since
+  # the kernel sits at the bottom of the response).
+  max_seq_len: 8192
+
+multitask:
+  problems_per_step: 4           # N = problems per step (4 problems × 8 rollouts = 32 seqs/step)
+  num_steps: 200
+  # 'disk': save full HF checkpoint to <run_root>/ckpts/step_N each step,
+  # POST /update_weights_from_disk to SGLang. ~15s overhead per step.
+  # 'nccl': torch.distributed broadcast (~2s). The secondary process group
+  # bootstrap was broken on this cluster on first launch — see
+  # weight_broadcast.py. Disk is the known-working path.
+  weight_sync: disk
+  weight_sync_master_port: 29600
+
+loop:
+  num_turns: 1                   # unused in multitask path
+  persist_adapter_across_problems: false
+  problem_batch_size: 1
+  seed: 0
+
+logging:
+  out_dir: ./runs
+  run_name: null
+  log_every: 1
+  save_adapter_every_turn: false
+  wandb:
+    enabled: true
+    project: ttt-kernel
+    entity: null
+    run_name: null
+    mode: online
+    tags: ["multitask", "full-model", "qwen3-32b", "REINFORCE"]

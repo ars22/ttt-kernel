@@ -1,5 +1,13 @@
 # ttt-kernel
 
+> **NOTE (refactor branch):** this branch is being rewritten into a
+> three-pool (sampler / trainer / env) architecture with a central
+> orchestrator. The instructions below describe the OLD pair-orchestrator
+> layout (still on `main`) and are stale. The new entry points
+> (`orchestrator/main.py`, SLURM launchers under `scripts/`) land
+> incrementally; see `/home/schmidt/ssci-asetlur/.claude/plans/so-we-need-to-moonlit-flame.md`
+> for the design.
+
 Multi-turn online RL with LoRA over [KernelBench](https://github.com/ScalingIntelligence/KernelBench) problems.
 
 For each problem in KernelBench we:

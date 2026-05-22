@@ -1,0 +1,80 @@
+# TTT smoke for gpt-oss-120b: 1 problem, K=16 rollouts × 32 GRPO turns,
+# per-problem adapter (reset each problem).
+# Topology assumed by scripts/run_ttt_multinode.sh:
+#   Node 0: SGLang tp=4 dp=1 (GPUs 0-3) + 4 env services (GPUs 4-7)
+#   Node 1: 4 trainers × tp=2 (torchrun --nproc-per-node=2 each, GPUs 0-7)
+
+model:
+  name: openai/gpt-oss-120b
+  dtype: bfloat16
+  trust_remote_code: true
+
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+  bias: "none"
+
+sglang:
+  base_url: http://127.0.0.1:30100
+  adapter_name: ttt
+  adapter_out_dir: ./adapters/ttt
+  update_weights_endpoint: /update_weights_from_disk
+
+rollout:
+  num_samples: 16
+  max_tokens: 28000
+  temperature: 1.0
+  top_p: 0.95
+  reasoning_effort: high
+
+kernelbench:
+  repo_path: /project/flame/asetlur/KernelBench
+  dataset_src: huggingface
+  dataset_name: ScalingIntelligence/KernelBench
+  level: 1
+  problem_ids: [1]            # smoke: just one problem
+  backend: cuda
+  precision: fp32
+  gpu_arch: Hopper            # H100 cluster
+  prompt_option: one_shot
+  num_correct_trials: 5
+  num_perf_trials: 20
+  timing_method: cuda_event
+  eval_timeout_s: 120
+
+reward:
+  speedup_log_scale: true
+  error_penalty: -3.0
+  incorrect_penalty: -3.0
+  clip: 2.0
+
+grpo:
+  beta_kl: 0.04
+  group_advantage_norm: true
+  update_epochs: 1
+  learning_rate: 1.0e-5
+  weight_decay: 0.0
+  grad_clip: 1.0
+  micro_batch_size: 1
+  max_seq_len: 16384          # truncate (prompt+completion) loss pass
+
+loop:
+  num_turns: 32
+  persist_adapter_across_problems: false
+  problem_batch_size: 1
+  seed: 0
+
+logging:
+  out_dir: ./runs
+  run_name: null
+  log_every: 1
+  save_adapter_every_turn: false
+  wandb:
+    enabled: true
+    project: ttt-kernel
+    entity: null
+    run_name: null
+    mode: online
+    tags: ["ttt", "gpt-oss-120b", "smoke", "K16T32"]

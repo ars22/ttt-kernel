@@ -1,0 +1,72 @@
+# Smallest end-to-end smoke test of the three-pool architecture.
+#
+# Used by run_refactor.sh as the default for the multi-node smoke test:
+# 1 sampler + 1 trainer + 2 env workers, 2 problems × 2 turns.
+# Pass criteria: events.jsonl has problem_done rows for both, each problem
+# has adapter dirs at v000, v001, v002 on disk.
+
+model:
+  name: Qwen/Qwen3-4B-Instruct-2507
+  dtype: bfloat16
+  trust_remote_code: true
+
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.0
+  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+  bias: "none"
+
+rollout:
+  num_samples: 2
+  max_tokens: 4096
+  temperature: 1.0
+  top_p: 0.95
+
+kernelbench:
+  repo_path: /weka/scratch/schmidt/ssci-aviralku/asetlur/KernelBench
+  dataset_src: huggingface
+  dataset_name: ScalingIntelligence/KernelBench
+  level: 1
+  problem_ids: [1, 2]
+  backend: cuda
+  precision: fp32
+  gpu_arch: Blackwell
+  prompt_option: one_shot
+  num_correct_trials: 3
+  num_perf_trials: 20
+  timing_method: cuda_event
+  eval_timeout_s: 60
+
+reward:
+  speedup_log_scale: true
+  error_penalty: -3.0
+  incorrect_penalty: -3.0
+  clip: 2.0
+
+grpo:
+  beta_kl: 0.04
+  group_advantage_norm: true
+  update_epochs: 1
+  learning_rate: 1.0e-5
+  weight_decay: 0.0
+  grad_clip: 1.0
+  micro_batch_size: 1
+  max_seq_len: 4096
+
+loop:
+  num_turns: 2
+  seed: 0
+
+logging:
+  out_dir: ./runs
+  run_name: null
+  log_every: 1
+  save_adapter_every_turn: true
+  wandb:
+    enabled: false
+    project: ttt-kernel
+    entity: null
+    run_name: null
+    mode: online
+    tags: []
