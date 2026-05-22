@@ -1,0 +1,83 @@
+model:
+  name: Qwen/Qwen3-4B
+  dtype: bfloat16
+  trust_remote_code: true
+
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+  bias: "none"
+
+sglang:
+  base_url: http://127.0.0.1:30100
+  adapter_name: unused
+  adapter_out_dir: ./adapters/unused
+  update_weights_endpoint: /update_weights_from_disk
+  # Inference TP. With dp=8 tp=1 (per node0 worker), tp_size here means the
+  # trainer-side broadcast group only writes/reads one full tensor (no TP
+  # sharding needed on inference side).
+  tp_size: 1
+
+rollout:
+  num_samples: 8
+  max_tokens: 8000
+  temperature: 1.0
+  top_p: 0.95
+
+kernelbench:
+  repo_path: /project/flame/asetlur/KernelBench
+  dataset_src: huggingface
+  dataset_name: ScalingIntelligence/KernelBench
+  level: 1
+  problem_ids: null
+  backend: cuda
+  precision: fp32
+  gpu_arch: Hopper
+  prompt_option: one_shot
+  num_correct_trials: 5
+  num_perf_trials: 20
+  timing_method: cuda_event
+  eval_timeout_s: 120
+
+reward:
+  speedup_log_scale: true
+  error_penalty: -3.0
+  incorrect_penalty: -3.0
+  clip: 2.0
+
+grpo:
+  beta_kl: 0.0
+  group_advantage_norm: true
+  update_epochs: 1
+  learning_rate: 1.0e-6
+  weight_decay: 0.0
+  grad_clip: 1.0
+  micro_batch_size: 1
+  max_seq_len: 8192
+
+multitask:
+  problems_per_step: 4
+  num_steps: 200
+  weight_sync: disk
+  weight_sync_master_port: 29600
+
+loop:
+  num_turns: 1
+  persist_adapter_across_problems: false
+  problem_batch_size: 1
+  seed: 0
+
+logging:
+  out_dir: ./runs
+  run_name: null
+  log_every: 1
+  save_adapter_every_turn: false
+  wandb:
+    enabled: true
+    project: ttt-kernel
+    entity: null
+    run_name: null
+    mode: online
+    tags: ["multitask", "full-model", "qwen3-4b", "REINFORCE"]

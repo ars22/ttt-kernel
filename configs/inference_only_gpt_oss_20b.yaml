@@ -1,0 +1,85 @@
+model:
+  name: openai/gpt-oss-120b
+  dtype: bfloat16
+  trust_remote_code: true
+
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+  bias: "none"
+
+sglang:
+  base_url: http://127.0.0.1:30100
+  adapter_name: ttt
+  adapter_out_dir: ./adapters/ttt
+  update_weights_endpoint: /update_weights_from_disk
+
+rollout:
+  num_samples: 8
+  # Match TTT-Discover (arXiv:2601.16175) token budget for gpt-oss-120b:
+  # context window 32768, generate up to (32768 - prompt_length). Our prompts
+  # are ~3-4k so 28000 leaves ~4768 headroom over a 32k context. SGLang is
+  # launched with --context-length 65536 so this never bumps the server cap.
+  max_tokens: 28000
+  temperature: 1.0
+  top_p: 0.95
+  # gpt-oss harmony knob; "high" gives the model its longest CoT budget.
+  reasoning_effort: high
+
+kernelbench:
+  repo_path: /project/flame/asetlur/KernelBench
+  dataset_src: huggingface
+  dataset_name: ScalingIntelligence/KernelBench
+  level: 1
+  # No problem_ids → env service serves all 100 KernelBench L1 problems.
+  problem_ids: null
+  backend: cuda
+  precision: fp32
+  # Cluster is H100 (compute 9.0), not Blackwell as initially assumed. Setting
+  # an unrecognized arch string (like "Blackwell" or "sm_100a") makes nvcc emit
+  # code for that arch only, and the kernel fails to launch on H100 with
+  # "no kernel image is available for execution on the device". "Hopper" is in
+  # KernelBench's NVIDIA_ARCHS and resolves to sm_90/sm_90a.
+  gpu_arch: Hopper
+  prompt_option: one_shot
+  num_correct_trials: 5
+  num_perf_trials: 20
+  timing_method: cuda_event
+  eval_timeout_s: 120
+
+reward:
+  speedup_log_scale: true
+  error_penalty: -3.0
+  incorrect_penalty: -3.0
+  clip: 2.0
+
+grpo:
+  beta_kl: 0.04
+  group_advantage_norm: true
+  update_epochs: 1
+  learning_rate: 1.0e-5
+  weight_decay: 0.0
+  grad_clip: 1.0
+  micro_batch_size: 1
+  max_seq_len: 16384
+
+loop:
+  num_turns: 1
+  persist_adapter_across_problems: false
+  problem_batch_size: 1
+  seed: 0
+
+logging:
+  out_dir: ./runs
+  run_name: null
+  log_every: 1
+  save_adapter_every_turn: false
+  wandb:
+    enabled: true
+    project: ttt-kernel
+    entity: null
+    run_name: null
+    mode: online
+    tags: ["inference-only", "gpt-oss-120b", "L1-full"]

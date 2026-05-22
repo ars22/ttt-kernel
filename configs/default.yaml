@@ -50,14 +50,13 @@ reward:
   # Maps (compiled, correct, speedup) -> scalar reward.
   # speedup > 1: positive (favored); speedup < 1: negative; any error: negative.
   speedup_log_scale: true   # use log(speedup) so 2x and 0.5x are symmetric
-  error_penalty: -1.0
-  incorrect_penalty: -1.0
+  error_penalty: -3.0
+  incorrect_penalty: -3.0
   # Clip rewards to [-clip, clip] before normalization
   clip: 2.0
 
 grpo:
   beta_kl: 0.04                # KL coeff to reference (frozen base + frozen adapter snapshot)
-  epsilon_clip: 0.2            # PPO-style importance-sampling clip
   group_advantage_norm: true   # subtract group mean / divide by group std
   update_epochs: 1             # gradient passes per turn over the K rollouts
   learning_rate: 1.0e-5
@@ -74,26 +73,6 @@ loop:
   # Train one adapter jointly on this many problems at a time.
   problem_batch_size: 8
   seed: 0
-
-pool:
-  # Number of (sampler, trainer) pairs. Each pair is independent and processes
-  # one problem at a time over num_turns turns of online RL with LoRA hot-swap.
-  num_pairs: 4
-  sampler:
-    dp: 1
-    tp: 1
-    sp: 1
-  trainer:
-    dp: 1
-    tp: 1
-    sp: 1
-  # First SGLang port; subsequent pairs use base_port+i (skipping in-use ports).
-  base_port: 30000
-  # Max in-flight problems per pair. Orchestrator assigns to the least-loaded
-  # pair until each is full; new problems start as soon as one completes.
-  max_inflight_per_pair: 10
-  # Max number of LoRAs SGLang can keep registered/batched at once.
-  sglang_max_loras: 16
 
 logging:
   out_dir: ./runs
