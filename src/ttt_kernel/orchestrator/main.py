@@ -117,6 +117,12 @@ async def _drive(
     if re_val is not None:
         sample_kwargs["reasoning_effort"] = str(re_val)
     K = int(cfg["rollout"].get("num_samples", 8))
+    # group_size partitions the K rollouts of a turn into K/group_size groups
+    # for the GRPO advantage baseline. Default is K (one group). Set smaller
+    # to get per-group baselines (e.g. K=512, group_size=16 → 32 groups of 16).
+    group_size = int(cfg["rollout"].get("group_size", K))
+    if K % group_size != 0:
+        raise ValueError(f"num_samples ({K}) must be divisible by group_size ({group_size})")
     num_turns = int(cfg["loop"].get("num_turns", 5))
     adapters_root = str(run_root / "adapters")
 
@@ -205,6 +211,7 @@ async def _drive(
                         problem_id=pid,
                         num_turns=num_turns,
                         K=K,
+                        group_size=group_size,
                         sampler_pool=sampler_pool,
                         env_pool=env_pool,
                         trainer_pool=trainer_pool,

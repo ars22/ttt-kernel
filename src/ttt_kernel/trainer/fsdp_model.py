@@ -78,6 +78,14 @@ def build_fsdp_peft_model(
     peft_model.to(device)
     peft_model.train()
 
+    # Activation checkpointing: at T=8192 with 36 transformer blocks, naive
+    # forward retains ~6+ GB of activations per rank. Recomputing in backward
+    # cuts this by ~5x at the cost of one extra forward. PEFT requires the
+    # input tensor to require grad (since base params are frozen) — otherwise
+    # the checkpointed segment has no grad path.
+    peft_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    peft_model.enable_input_require_grads()
+
     blocks = _find_transformer_blocks(peft_model)
     log.info("rank %d wrapping %d transformer blocks with fully_shard", rank, len(blocks))
     mp = MixedPrecisionPolicy(

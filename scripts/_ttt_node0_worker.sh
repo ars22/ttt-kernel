@@ -59,11 +59,12 @@ PY
 # for dynamic LoRA loading (SGLang rejects /load_lora_adapter when dp>1).
 # --max-loras-per-batch 4 caps simultaneously-active adapters per batch.
 echo "[ttt-node0:$NODE_HOST] launching SGLang (GPUs 0-3, tp=4 dp=1, --enable-lora) → $LOGS/sglang_${SUFFIX}.log"
+SGLANG_CTX="${SGLANG_CONTEXT_LENGTH:-65536}"
 CUDA_VISIBLE_DEVICES=0,1,2,3 nohup "$PY" -m sglang.launch_server \
     --model-path "$MODEL_NAME" \
     --host 0.0.0.0 \
     --port "$SGLANG_PORT" \
-    --context-length 65536 \
+    --context-length "$SGLANG_CTX" \
     --dtype bfloat16 \
     --tp-size 4 \
     --dp-size 1 \
@@ -71,6 +72,8 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 nohup "$PY" -m sglang.launch_server \
     --attention-backend triton \
     --enable-lora \
     --max-loras-per-batch 4 \
+    --max-lora-rank "${SGLANG_MAX_LORA_RANK:-32}" \
+    --lora-target-modules q_proj k_proj v_proj o_proj gate_proj up_proj down_proj \
     --trust-remote-code \
     > "$LOGS/sglang_${SUFFIX}.log" 2>&1 &
 echo "$!" > "$RUN_ROOT/sglang_${SUFFIX}.pid"

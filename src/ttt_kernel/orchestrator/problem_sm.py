@@ -52,6 +52,7 @@ async def run_problem(
     problem_id: int,
     num_turns: int,
     K: int,
+    group_size: Optional[int] = None,
     sampler_pool: Pool,
     env_pool: Pool,
     trainer_pool: Optional[Pool],
@@ -172,6 +173,10 @@ async def run_problem(
                 Rollout(prompt=prompt, completion=c, reward=float(r.reward))
                 for c, r in zip(completions, eval_results)
             ]
+            # Group the K rollouts into K/group_size groups of group_size each
+            # for per-group baseline in GRPO. group_size=None → one group of K.
+            gs = group_size if group_size is not None else len(rollouts)
+            group_ids = [i // gs for i in range(len(rollouts))]
             async with trainer_pool.acquire() as (tclient, tentry):  # type: ignore[union-attr]
                 treq = TrainRequest(
                     problem_id=problem_id,
@@ -181,6 +186,7 @@ async def run_problem(
                     adapter_out_path=str(next_ref.path),
                     adapter_out_name=next_ref.name,
                     rollouts=rollouts,
+                    group_ids=group_ids,
                 )
                 logger.log("train_start", problem_id=problem_id, turn=turn,
                            trainer_idx=tentry.idx,
